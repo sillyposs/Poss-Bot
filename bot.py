@@ -6490,6 +6490,971 @@ async def roster(interaction: discord.Interaction):
 
 
 # --------------------------------------------------------------------------
+# ESO Patch Notes watcher
+#
+# What it does
+#   Every few minutes it asks the ESO forum for the newest threads in the Patch Notes category
+#   (https://forums.elderscrollsonline.com/en/categories/patch-notes) and announces each NEW thread once, with a link and the
+#   first lines of the post, in the same channel as the Xbox status announcements. The announcement is the thread's title as a
+#   link, with a 📜 in front and a blue bar, or a 🔧 and an orange bar when the title says hotfix. Only threads are watched, not
+#   replies to older threads. A hotfix is announced like any other thread in that category. For threads that were already there
+#   when it first started it posts nothing, except the single newest one if it is younger than ESO_PATCH_NOTES_FIRST_RUN_HOURS,
+#   so that a post made just before the bot started is not lost.
+#
+# Where it reads
+#   The forum's own API, https://forums.elderscrollsonline.com/api/v2/..., the same data the forum's pages are built from.
+#   Nothing here logs in and nothing is ever written to the forum. It talks to that one address only, over https (a redirect
+#   anywhere else counts as a failed check), about once every ESO_PATCH_NOTES_INTERVAL_SECONDS (300 unless changed), and
+#   waits longer while the forum keeps failing or asks to be left alone (HTTP 429 with a Retry-After).
+#   The category is found by asking the forum for its list of categories and taking the one whose address name is
+#   "patch-notes"; its number is then kept in the saved file. ESO_PATCH_NOTES_CATEGORY_ID (just below) skips that look-up.
+#
+# Where it posts
+#   Wherever the Xbox status announcements go (_esom_target and _esom_destination): while ESO_STATUS_LIVE is on, the main
+#   server's announcement channel (ESO_STATUS_MAIN_CHANNEL_ID), otherwise the test channel. If that place doesn't check out,
+#   nothing is posted and the log says why. An announcement never pings anyone.
+#
+# What it remembers
+#   A small file (/data/eso_patch_notes_state.json on FadeHost): the number of the category and the numbers of the threads it
+#   has dealt with. A thread is added when it has been announced (or skipped for being more than a week old), so a restart never
+#   repeats one, and a post that Discord refuses is tried again at the next check (three tries, then it is given up on and the
+#   owner is told). A file that can't be read is set aside, never overwritten, and the first look starts again.
+#
+# When something is wrong
+#   A check that fails (the forum is down, answers with an error, or gives an answer that doesn't look like threads) changes
+#   nothing and announces nothing. After three failed checks in a row Poss Bot posts a ⚠️ warning in ESO_OBSERVER_CHANNEL_ID,
+#   pinging ESO_OBSERVER_PING_USER_ID, at most once an hour, and a ✅ when the forum can be read again. The first look after a
+#   fresh start is reported there too, so it is plain that the watcher works. ESO_PATCH_NOTES=off stops the whole watcher.
+# --------------------------------------------------------------------------
+
+ESO_PATCH_NOTES_CATEGORY_ID = 0  # 0 = find the Patch Notes category by itself (recommended); otherwise the forum's own number for it
+ESO_PATCH_NOTES_FIRST_RUN_HOURS = 36  # at the very first start, announce the newest thread if it is younger than this many hours (0 = announce nothing then)
+
+_EPN_ENABLED = _esom_flag("ESO_PATCH_NOTES", True)  # off switches the whole watcher off
+try:
+    _EPN_INTERVAL = min(3600, max(120, int(os.environ.get("ESO_PATCH_NOTES_INTERVAL_SECONDS", "300"))))
+except ValueError:
+    _EPN_INTERVAL = 300
+# Where the saved list is kept: ESO_PATCH_NOTES_STATE_PATH if set, else /data when that folder exists, else next to this script.
+_EPN_STATE_FILE = Path(
+    os.environ.get("ESO_PATCH_NOTES_STATE_PATH")
+    or (Path("/data/eso_patch_notes_state.json") if Path("/data").is_dir() else Path(__file__).parent / "eso_patch_notes_state.json")
+)
+
+_EPN_API = "https://forums.elderscrollsonline.com/api/v2"
+_EPN_SITE = "https://forums.elderscrollsonline.com"
+_EPN_HOSTS = ("forums.elderscrollsonline.com",)  # a request or a redirect may only go to this host...
+_EPN_SCHEMES = ("https",)  # ...over https
+_EPN_CATEGORY_CODE = "patch-notes"  # the category's address name: .../categories/patch-notes
+_EPN_CATEGORY_NAME = "patch notes"  # its visible name, used only if nothing has the address name above
+_EPN_CATEGORY_PAGES = 10  # the most pages (of 100 categories) looked through when finding the category
+_EPN_LIST_LIMIT = 10  # how many of the newest threads are asked for at each check
+_EPN_TIMEOUT = 10  # seconds the forum gets for each step of a request
+_EPN_TOTAL_TIMEOUT = 25  # seconds for a whole request, reading the answer included
+_EPN_MAX_BYTES = 4_000_000  # the most that is read from one answer (and the most it may unpack to)
+_EPN_MAX_AGE = 7 * 24 * 3600  # seconds; a thread older than this that only now turns up is skipped, not announced
+_EPN_MAX_PER_RUN = 5  # the most announcements made at one check (the rest wait for the next)
+_EPN_MAX_PER_HOUR = 10  # the most announcements in an hour, however many threads turn up
+_EPN_SEEN_KEEP = 200  # how many thread numbers are remembered
+_EPN_SEND_TRIES = 3  # how many times Discord may refuse one announcement before it is given up on
+_EPN_SEND_TIMEOUT = 30  # seconds Discord gets to accept a message
+_EPN_FAILS_BEFORE_WARNING = 3  # failed checks in a row before the owner is warned
+_EPN_WARN_EVERY = 3600  # seconds; the same kind of warning is not repeated sooner than this
+_EPN_BACKOFF_CAP = 900  # seconds; the longest wait between checks while the forum keeps failing
+_EPN_SLEEP_SLICE = 5  # seconds; the watcher sleeps in slices this long so it notices at once that the bot is closing
+_EPN_TEASER_CHARS = 400  # how much of the post is shown under the title
+_EPN_BLUE, _EPN_ORANGE = 0x3498DB, 0xE67E22  # patch notes, hotfix
+_EPN_HOTFIX = re.compile(r"\bhot[\s\-]*fix", re.IGNORECASE)
+# Characters that are never wanted in text taken from the forum: control characters, line and paragraph separators, and the
+# characters that can make text run backwards or hide other text.
+_EPN_CONTROL = re.compile("[\x00-\x1f\x7f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+_EPN_BREAKS = re.compile(r"(?i)<\s*(?:br\s*/?|/\s*(?:p|div|li|ul|ol|h[1-6]|tr|blockquote))\s*>")
+
+
+def _epn_now() -> datetime:
+    return _utcnow()
+
+
+def _epn_mono() -> float:
+    return time.monotonic()
+
+
+def _epn_first_run_seconds() -> float:
+    """How young the newest thread must be to be announced at the very first start, in seconds (0 = never)."""
+    hours = ESO_PATCH_NOTES_FIRST_RUN_HOURS
+    if isinstance(hours, bool) or not isinstance(hours, (int, float)) or hours <= 0:
+        return 0.0
+    return float(hours) * 3600
+
+
+# ----- reading the forum -----------------------------------------------------------------------------------------
+
+class _EpnError(Exception):
+    """A request or reading that gave nothing trustworthy. `kind` is short and plain and goes in the log; `detail` (optional) is
+    a longer explanation for the warning to the owner; `wait` is how many seconds the forum asked to be left alone, if it did;
+    `topic` says which warning this belongs to. None of them ever holds text from the forum's pages."""
+
+    def __init__(self, kind: str, detail: str = "", wait: float = 0.0, topic: str = "read") -> None:
+        super().__init__(kind)
+        self.kind, self.detail, self.wait, self.topic = kind, detail, wait, topic
+
+
+class _EpnRedirects(urllib.request.HTTPRedirectHandler):
+    max_redirections = 3
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        target = urllib.parse.urlsplit(newurl)
+        if target.scheme not in _EPN_SCHEMES or (target.hostname or "").lower() not in _EPN_HOSTS:
+            return None  # anywhere else counts as a failed check, not something to follow
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _epn_gunzip(data: bytes, limit: int) -> bytes:
+    """Unpack a gzip-compressed answer, refusing to produce more than `limit` bytes (so a tiny file can't unpack into a huge one)."""
+    import zlib
+
+    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)  # 16 + ... = a gzip wrapper
+    try:
+        out = decoder.decompress(data, limit + 1)
+    except zlib.error:
+        raise _EpnError("the reply was damaged") from None
+    if len(out) > limit:
+        raise _EpnError("the reply is much bigger than expected")
+    if not decoder.eof:
+        raise _EpnError("connection dropped")  # the compressed answer stops before its end
+    return out
+
+
+def _epn_retry_after(headers: Any) -> float:
+    """The seconds a Retry-After header asks for (at most an hour), or 0 if there is none or it isn't a plain number."""
+    try:
+        value = headers.get("retry-after") if headers is not None else None
+    except Exception:
+        return 0.0
+    if isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
+        return float(min(int(value.strip()), 3600))
+    return 0.0
+
+
+def _epn_read(response: Any, started: float) -> bytes:
+    """The body of the answer, read up to the size limit and the overall time limit, and unpacked if it came gzip-compressed."""
+    deadline = started + _EPN_TOTAL_TIMEOUT - 3
+    chunks: List[bytes] = []
+    size = 0
+    take = getattr(response, "read1", response.read)  # read1 returns what has arrived, so a site that trickles can't hold this up
+    while True:
+        if time.monotonic() > deadline:
+            raise _EpnError("timed out")
+        chunk = take(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > _EPN_MAX_BYTES:
+            raise _EpnError("the reply is much bigger than expected")
+    message = response.headers
+    promised = message.get("content-length")
+    if promised is not None and promised.strip().isascii() and promised.strip().isdigit() and size < int(promised):
+        raise _EpnError("connection dropped")  # the forum hung up before the whole answer arrived
+    body = b"".join(chunks)
+    encoding = (message.get("content-encoding") or "identity").strip().lower()
+    if encoding in ("gzip", "x-gzip"):
+        return _epn_gunzip(body, _EPN_MAX_BYTES)
+    if encoding not in ("", "identity"):
+        raise _EpnError("the reply was compressed in a way I can't read")
+    return body
+
+
+def _epn_request(path: str) -> Any:
+    """One GET of an API address, answered as parsed JSON. It blocks, so it runs in a worker thread. Raises _EpnError for anything
+    that isn't a normal JSON answer."""
+    started = time.monotonic()
+    request = urllib.request.Request(_EPN_API + path, headers={
+        "User-Agent": f"PossBot/1.0 (Discord bot; read-only ESO forum Patch Notes watcher; about one request every {_EPN_INTERVAL} seconds)",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+    })
+    try:
+        with urllib.request.build_opener(_EpnRedirects).open(request, timeout=_EPN_TIMEOUT) as response:
+            status = response.status
+            content_type = response.headers.get("content-type") or ""
+            charset = response.headers.get_content_charset() or "utf-8"
+            body = _epn_read(response, started)
+    except urllib.error.HTTPError as error:  # 4xx, 5xx and a refused redirect: an answer, but not one to use
+        wait = _epn_retry_after(error.headers)
+        with contextlib.suppress(Exception):
+            error.close()
+        raise _EpnError(f"HTTP {error.code}", wait=wait) from None
+    except _EpnError:
+        raise
+    except Exception as error:
+        raise _EpnError(_esom_error_kind(error)) from None
+    if status != 200:
+        raise _EpnError(f"HTTP {status}")
+    if "json" not in content_type.lower():
+        raise _EpnError("the reply was not JSON")
+    if charset.lower().replace("_", "-") in ("utf-8", "utf8"):
+        charset = "utf-8-sig"  # (also accepts a byte-order mark at the start, which JSON must not have)
+    try:
+        text = body.decode(charset, errors="replace")
+    except LookupError:  # a character set Python doesn't know
+        text = body.decode("utf-8-sig", errors="replace")
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        raise _EpnError("the reply was not valid JSON") from None
+
+
+async def _epn_fetch(path: str) -> Any:
+    """Ask the forum for one API address in a worker thread, so the bot never waits for it. Raises _EpnError if there is no
+    trustworthy answer."""
+    try:
+        return await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(None, _epn_request, path), _EPN_TOTAL_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise _EpnError("timed out") from None
+    except _EpnError:
+        raise
+    except Exception:
+        log.exception("Patch Notes watcher: the forum could not be read because of a fault in the watcher")
+        raise _EpnError("a fault in the watcher (see the log)") from None
+
+
+# ----- turning the forum's answer into threads -------------------------------------------------------------------
+
+class _EpnThread:
+    """One thread of the Patch Notes category as the forum described it. Every text in it is already safe to show."""
+
+    def __init__(self, ident: int, title: str, url: str, posted: Optional[datetime], category_id: int, teaser: str) -> None:
+        self.ident, self.title, self.url = ident, title, url
+        self.posted, self.category_id, self.teaser = posted, category_id, teaser
+
+
+def _epn_int(value: Any) -> int:
+    """A positive whole number from the forum's JSON (a number, or text made only of digits), or 0 if it isn't one."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value if value > 0 else 0
+    if isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 18:
+        return int(value)
+    return 0
+
+
+def _epn_date(value: Any) -> Optional[datetime]:
+    """The moment in a date such as "2026-10-28T20:14:03+00:00" (UTC if it says nothing), or None if it isn't one."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+def _epn_clean(value: Any, limit: int) -> str:
+    """One line of plain text from something the forum sent: control characters gone, spaces tidied, cut to `limit` characters
+    (ending in "…" if it was cut). Anything that isn't text gives ""."""
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(_EPN_CONTROL.sub(" ", value).split())
+    if len(text) > limit:
+        text = text[: max(0, limit - 1)].rstrip() + "…"
+    return text
+
+
+def _epn_strip_tags(text: str) -> str:
+    """The text without its <tags>. One pass, so odd or hostile markup can't make it slow. A "<" that doesn't start a tag (as in
+    "1 < 2") stays; a tag that is never closed takes the rest of the text with it."""
+    parts: List[str] = []
+    pos = 0
+    while True:
+        start = text.find("<", pos)
+        if start < 0:
+            parts.append(text[pos:])
+            break
+        parts.append(text[pos:start])
+        after = text[start + 1:start + 2]
+        if after and (after.isalpha() or after in "/!?"):
+            end = text.find(">", start + 1)
+            if end < 0:
+                break
+            pos = end + 1
+        else:
+            parts.append("<")
+            pos = start + 1
+    return "".join(parts)
+
+
+def _epn_plain(raw: str, limit: int) -> str:
+    """The readable start of a post that the forum gave as HTML: line breaks kept (one per paragraph), tags gone, character codes
+    turned into characters, cut to `limit` characters at a word."""
+    text = html.unescape(_epn_strip_tags(_EPN_BREAKS.sub("\n", raw[:20000])))
+    lines = [" ".join(_EPN_CONTROL.sub(" ", line).split()) for line in text.split("\n")]
+    text = "\n".join(line for line in lines if line)
+    if len(text) > limit:
+        room = max(1, limit - 1)  # (one character is kept for the "…")
+        cut = text[:room]
+        space = max(cut.rfind(" "), cut.rfind("\n"))
+        if space >= room // 2:
+            cut = cut[:space]
+        text = cut.rstrip(" \n,.;:-–—") + "…"
+    return text
+
+
+def _epn_teaser(item: Dict[str, Any]) -> str:
+    """The start of the post, for under the title: the forum's own short text if it sent one, otherwise the start of the post."""
+    for key in ("excerpt", "body"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            text = _epn_plain(value, _EPN_TEASER_CHARS)
+            if len(text) >= 20:
+                return text
+    return ""
+
+
+def _epn_thread_url(value: Any, ident: int) -> str:
+    """The link to a thread: the one the forum gave, if it is an https address on the forum itself, otherwise the forum's own
+    short address for that thread number (which the forum turns into the full one)."""
+    if isinstance(value, str):
+        link = value.strip()
+        # Only plain address characters (no spaces, backslashes, quotes or angle brackets), and no "name@" in front of the host.
+        if 0 < len(link) <= 1000 and re.fullmatch(r"[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+", link):
+            try:
+                parts = urllib.parse.urlsplit(link)
+                host = (parts.hostname or "").lower()
+                plain = parts.username is None and parts.password is None and parts.port in (None, 443)
+            except ValueError:
+                parts, host, plain = None, "", False
+            if parts is not None and plain and parts.scheme in _EPN_SCHEMES and host in _EPN_HOSTS:
+                return link
+    return f"{_EPN_SITE}/en/discussion/{ident}"
+
+
+def _epn_threads(data: Any) -> List[_EpnThread]:
+    """The threads in the forum's answer to a request for a list of discussions. Entries that are missing a number, a title or a
+    category are left out. An answer that isn't a list, or a non-empty list in which nothing is usable, is an error: it means
+    the forum's answer has changed shape, and nothing may be announced from it."""
+    if not isinstance(data, list):
+        raise _EpnError("the forum's answer was not a list of threads", topic="shape")
+    threads: List[_EpnThread] = []
+    taken: Set[int] = set()
+    for item in data[:200]:
+        if not isinstance(item, dict):
+            continue
+        ident = _epn_int(item.get("discussionID"))
+        title = _epn_clean(item.get("name"), 256)
+        category = _epn_int(item.get("categoryID"))
+        if not ident or not title or not category or ident in taken:
+            continue
+        taken.add(ident)
+        threads.append(_EpnThread(
+            ident, title, _epn_thread_url(item.get("url"), ident), _epn_date(item.get("dateInserted")), category, _epn_teaser(item),
+        ))
+    if data and not threads:
+        raise _EpnError("the forum's answer has a shape I don't recognise", topic="shape")
+    return threads
+
+
+def _epn_pick_category(data: Any) -> Tuple[int, List[str]]:
+    """(the number of the Patch Notes category or 0, "name (number)" for each category seen) from the forum's list of categories.
+    The category is the one whose address name is "patch-notes", else the one whose link ends that way, else the one called
+    "Patch Notes". Categories nested inside others are looked through too."""
+    by_code: List[int] = []
+    by_link: List[int] = []
+    by_name: List[int] = []
+    names: List[str] = []
+    stack: List[Any] = [data]
+    visited = 0
+    while stack and visited < 5000:
+        item = stack.pop()
+        if isinstance(item, list):
+            stack.extend(reversed(item))  # (reversed, so they are looked at in the forum's own order)
+            continue
+        if not isinstance(item, dict):
+            continue
+        visited += 1
+        children = item.get("children")
+        if isinstance(children, list):
+            stack.extend(reversed(children))
+        ident = _epn_int(item.get("categoryID"))
+        if not ident:
+            continue
+        name = _epn_clean(item.get("name"), 60)
+        names.append(f"{name or '?'} ({ident})")
+        code = item.get("urlcode")
+        if isinstance(code, str) and code.strip().lower() == _EPN_CATEGORY_CODE:
+            by_code.append(ident)
+        link = item.get("url")
+        if isinstance(link, str):
+            try:
+                last = urllib.parse.urlsplit(link.strip()).path.rstrip("/").rsplit("/", 1)[-1].lower()
+            except ValueError:
+                last = ""
+            if last == _EPN_CATEGORY_CODE:
+                by_link.append(ident)
+        if name.lower() == _EPN_CATEGORY_NAME:
+            by_name.append(ident)
+    for found in (by_code, by_link, by_name):
+        if found:
+            return min(found), names
+    return 0, names
+
+
+# ----- the announcement ---------------------------------------------------------------------------------------------
+
+def _epn_safe(text: str) -> str:
+    """Text from the forum made safe to put in a Discord message: mentions defused, markdown characters shown as they are."""
+    return discord.utils.escape_markdown(discord.utils.escape_mentions(text))
+
+
+def _epn_embed(thread: _EpnThread) -> Any:
+    """The announcement: the thread's title as a link to the thread (a 🔧 in front and an orange bar for a hotfix, a 📜 and a blue
+    bar for anything else), the first lines of the post, and a footer in the same style as the Xbox status announcements. There is
+    no heading above the title. Mentions in the forum's text are made harmless."""
+    hotfix = bool(_EPN_HOTFIX.search(thread.title))
+    teaser = _epn_safe(thread.teaser)[:4096] if thread.teaser else None  # (Discord's limits: 256 for the title, 4096 for the text)
+    embed = discord.Embed(
+        title=_epn_clean(("🔧 " if hotfix else "📜 ") + thread.title, 256),
+        url=thread.url,
+        description=teaser,
+        colour=discord.Colour(_EPN_ORANGE if hotfix else _EPN_BLUE),
+        timestamp=thread.posted,
+    )
+    embed.set_footer(text="Poss Bot watching [patch-notes]")
+    return embed
+
+
+# ----- the saved file ---------------------------------------------------------------------------------------------------
+
+class _EpnStore:
+    """The watcher's one small saved file. Knows nothing about Discord. It is saved atomically (a temporary file, then a swap),
+    and a file that can't be read is moved aside, never overwritten."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock: Optional[asyncio.Lock] = None  # created on first use, inside the running event loop
+        self._unsafe = False  # True if an unreadable file could not be moved aside
+
+    def _set_aside(self, label: str) -> Optional[Path]:
+        target = self._path.with_name(f"{self._path.name}.{label}-{_utcnow().strftime('%Y%m%dT%H%M%SZ')}")
+        try:
+            os.replace(self._path, target)
+            return target
+        except OSError:
+            log.exception("Patch Notes watcher: could not set aside %s", self._path)
+            return None
+
+    def _unusable(self, error: BaseException) -> None:
+        log.error("Patch Notes watcher: its saved file is unreadable (%s).", type(error).__name__)
+        saved = self._set_aside("corrupt")
+        if saved is None:
+            self._unsafe = True  # refuse to write, so the damaged file can't be overwritten
+            log.error("Patch Notes watcher: the unreadable file could not be moved aside, so nothing will be saved until it is fixed.")
+        else:
+            log.error("Patch Notes watcher: the unreadable file was kept as %s and the watcher starts from scratch.", saved.name)
+        return None
+
+    def load(self) -> Optional[Dict[str, Any]]:
+        """{"category_id": number, "seen": [thread numbers]} from the saved file, or None if there is no usable file (the very
+        first start, or a file that was unreadable and has been set aside)."""
+        try:
+            text = self._path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as error:
+            return self._unusable(error)
+        try:
+            data = json.loads(text)
+            if not isinstance(data, dict) or data.get("version") != 1:
+                raise ValueError("not a version 1 file")
+            seen = data["seen"]
+            category = data.get("category_id", 0)
+            if not isinstance(seen, list) or len(seen) > 5000 or isinstance(category, bool) or not isinstance(category, int) or category < 0:
+                raise ValueError("unexpected contents")
+        except (ValueError, KeyError, TypeError, RecursionError) as error:
+            return self._unusable(error)
+        return {"category_id": category, "seen": [_epn_int(value) for value in seen if _epn_int(value)]}
+
+    def _write(self, text: str) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self._path.with_name(self._path.name + ".tmp")
+        try:
+            with open(temp, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, self._path)  # all-or-nothing swap
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.remove(temp)
+            raise
+
+    async def save(self, snapshot: Dict[str, Any]) -> None:
+        """Write the snapshot atomically. Raises OSError if the file can't be written."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            if self._unsafe:
+                raise OSError("the saved file is unreadable and was not moved aside; refusing to overwrite it")
+            await asyncio.get_running_loop().run_in_executor(None, self._write, json.dumps(snapshot, indent=2, sort_keys=True))
+
+
+# ----- the watcher ---------------------------------------------------------------------------------------------------------
+
+class _EpnWatcher:
+    """Looks at the Patch Notes category every `interval` seconds and announces each new thread once. A failed or odd answer from the
+    forum is logged (and, after a few in a row, reported to the owner); it is never announced."""
+
+    def __init__(self, client: Any, interval: float, path: Path) -> None:
+        self.bot = client
+        self.interval = interval
+        self.store = _EpnStore(path)
+        self.category_id = 0  # the Patch Notes category's number, once known (the list of seen threads below belongs to it)
+        self.refresh = False  # True: ask the forum for the category's number again at the next check
+        self.seen: Optional[List[int]] = None  # numbers of the threads already dealt with; None until the first look
+        self.fails = 0  # checks in a row that gave no usable answer
+        self.warned_fail = False  # a warning about failing checks has been sent, so a "can be read again" is owed
+        self.blocked = 0  # checks in a row where an announcement was due but could not be posted for want of a usable channel
+        self.polling = False
+        self.sent: List[float] = []  # when each recent announcement was posted
+        self.tries: Dict[int, int] = {}  # how many times Discord has refused each thread's announcement
+        self.warned: Dict[str, float] = {}  # when each kind of warning was last sent
+        self.noted: Set[str] = set()  # things already logged, so each is logged once
+        self.wait_until = 0.0  # no request before this moment (a Retry-After from the forum)
+        self.problem = ""  # why the owner's channel can't be used, so each reason is logged once
+        self.where = "the announcement channel"  # how messages to the owner name the place announcements go
+
+    def _note(self, key: str, level: int, message: str, *args: Any) -> None:
+        if key not in self.noted:
+            self.noted.add(key)
+            log.log(level, message, *args)
+
+    # ----- start-up ---------------------------------------------------------
+
+    def restore(self) -> None:
+        """Pick up what the previous run saved. With no usable file the first look sets the starting point."""
+        saved = self.store.load()
+        if saved is None:
+            log.info("Patch Notes watcher: no saved list of threads, so the first look sets the starting point.")
+            return
+        self.seen = list(saved["seen"])
+        self.category_id = saved["category_id"]
+        log.info("Patch Notes watcher: carrying on from the saved list (%d thread(s) already dealt with).", len(self.seen))
+
+    async def check_destination(self) -> None:
+        """Say in the log, once at start-up, where announcements will go."""
+        mode, _, _ = _esom_target()
+        channel, problem = await _esom_destination(self.bot, mode)
+        if channel is None:
+            log.warning("Patch Notes watcher: nothing can be announced right now: %s.", problem)
+            return
+        self.where = f"#{getattr(channel, 'name', '?')}"
+        log.info("Patch Notes watcher: announcements go to #%s in “%s” (%s mode).", getattr(channel, "name", "?"), getattr(channel.guild, "name", "?"), mode)
+
+    # ----- saving -----------------------------------------------------------
+
+    async def _save(self, now: datetime) -> None:
+        seen = sorted(self.seen or [], reverse=True)[:_EPN_SEEN_KEEP]
+        snapshot = {"version": 1, "saved_at": _iso(now), "category_id": self.category_id, "seen": seen}
+        try:
+            await self.store.save(snapshot)
+        except OSError as error:
+            self._note("save", logging.ERROR, "Patch Notes watcher: could not save its list (%s). It keeps working, but a restart could repeat an announcement.", type(error).__name__)
+        else:
+            self.noted.discard("save")
+
+    def _mark(self, ident: int) -> None:
+        """Remember that this thread has been dealt with."""
+        if self.seen is None:
+            self.seen = []
+        if ident not in self.seen:
+            self.seen.append(ident)
+        if len(self.seen) > _EPN_SEEN_KEEP:
+            self.seen = sorted(self.seen, reverse=True)[:_EPN_SEEN_KEEP]
+
+    # ----- messages to the owner ------------------------------------------------
+
+    def _unusable(self, why: str) -> None:
+        if why != self.problem:
+            self.problem = why
+            log.warning("Patch Notes watcher: not posting to the owner's channel, only to the log: %s", why)
+        return None
+
+    async def _owner_channel(self) -> Optional[Any]:
+        """The channel for messages to the owner (the same test channel the ESO observer uses) if it can be used right now."""
+        if not ESO_OBSERVER_CHANNEL_ID:
+            return self._unusable("no channel is set (ESO_OBSERVER_CHANNEL_ID is 0)")
+        channel = self.bot.get_channel(ESO_OBSERVER_CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(ESO_OBSERVER_CHANNEL_ID)
+            except discord.NotFound:
+                return self._unusable("the channel no longer exists")
+            except discord.Forbidden:
+                return self._unusable("I don't have access to the channel")
+            except discord.HTTPException:
+                return self._unusable("Discord didn't answer when I looked the channel up")
+        if not isinstance(channel, discord.TextChannel) or getattr(channel, "id", None) != ESO_OBSERVER_CHANNEL_ID:
+            return self._unusable("it isn't a text channel")
+        guild = channel.guild
+        mod_log = self.bot.get_channel(MOD_LOG_CHANNEL_ID)
+        if mod_log is not None and getattr(getattr(mod_log, "guild", None), "id", None) == getattr(guild, "id", None):
+            return self._unusable("the channel is in the same server as the mod-log channel, so it is not the test server")
+        me = getattr(guild, "me", None)
+        if me is not None:  # (if the bot's own member isn't known yet, the send itself will show whether it is allowed)
+            permissions = channel.permissions_for(me)
+            if not (permissions.view_channel and permissions.send_messages):
+                return self._unusable("I'm missing View Channel or Send Messages there")
+        if self.problem:
+            log.info("Patch Notes watcher: posting to the owner's channel again")
+            self.problem = ""
+        return channel
+
+    async def _say(self, text: str, ping: bool = False) -> bool:
+        """Post a message to the owner's channel, pinging ESO_OBSERVER_PING_USER_ID if `ping` (allowed to reach that member and
+        nobody else). If the channel can't be used the text only goes to the log. True if it was posted."""
+        text = text[:1900]
+        who = _esom_id(ESO_OBSERVER_PING_USER_ID) if ping else 0  # (0 = nobody is pinged)
+        channel = await self._owner_channel()
+        if channel is None:
+            log.info("Patch Notes watcher (not posted):\n%s", text)
+            return False
+        allowed = discord.AllowedMentions.none()
+        if who:
+            text = f"<@{who}> {text}"
+            allowed = discord.AllowedMentions(everyone=False, roles=False, users=[discord.Object(id=who)], replied_user=False)
+        try:
+            await asyncio.wait_for(channel.send(text, allowed_mentions=allowed), _EPN_SEND_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("Patch Notes watcher: Discord took too long to accept a message to the owner's channel")
+            return False
+        except discord.HTTPException as error:
+            log.warning("Patch Notes watcher: Discord refused a message to the owner's channel (HTTP %s)", getattr(error, "status", "?"))
+            return False
+        return True
+
+    async def _warn(self, topic: str, text: str) -> bool:
+        """A ⚠️ warning with a ping, at most once an hour for each topic."""
+        now = _epn_mono()
+        last = self.warned.get(topic)
+        if last is not None and now - last < _EPN_WARN_EVERY:
+            return False
+        self.warned[topic] = now
+        await self._say(text, ping=True)
+        return True
+
+    # ----- one check --------------------------------------------------------
+
+    async def _lookup_category(self) -> int:
+        """Ask the forum for its list of categories and return the number of the Patch Notes one."""
+        names: List[str] = []
+        for page in range(1, _EPN_CATEGORY_PAGES + 1):
+            data = await _epn_fetch("/categories?" + urllib.parse.urlencode({"limit": 100, "page": page}))
+            if not isinstance(data, list):
+                raise _EpnError("the forum's list of categories was not a list", topic="shape")
+            found, seen = _epn_pick_category(data)
+            if found:
+                log.info("Patch Notes watcher: the Patch Notes category is number %d.", found)
+                return found
+            fresh = [name for name in seen if name not in names]
+            if not fresh:
+                break  # an empty page, or only categories seen already: that was all of them
+            names.extend(fresh)
+        shown = _epn_safe(", ".join(names[:40])) or "none"
+        if len(names) > 40:
+            shown += f" … and {len(names) - 40} more"
+        raise _EpnError(
+            "no category called patch-notes was found",
+            detail=f"I asked the forum for its list of categories but none of them is called patch-notes. The ones I saw: {shown}.",
+            topic="category",
+        )
+
+    async def _category(self) -> int:
+        configured = _esom_id(ESO_PATCH_NOTES_CATEGORY_ID)
+        if configured:
+            return configured
+        if self.category_id and not self.refresh:
+            return self.category_id
+        found = await self._lookup_category()
+        self.refresh = False
+        return found
+
+    async def _read(self) -> List[_EpnThread]:
+        """The newest threads of the Patch Notes category. Raises _EpnError if the forum gave no trustworthy answer."""
+        category = await self._category()
+        if self.category_id and category != self.category_id:
+            log.warning("Patch Notes watcher: the category is now number %d, not %d, so the saved list is dropped and a new starting point is taken.", category, self.category_id)
+            self.seen = None
+        self.category_id = category
+        query = urllib.parse.urlencode({"categoryID": category, "limit": _EPN_LIST_LIMIT, "sort": "-dateInserted"})
+        try:
+            threads = _epn_threads(await _epn_fetch("/discussions?" + query))
+        except _EpnError as error:
+            if error.kind == "HTTP 404":
+                self.refresh = True  # the number may have changed: ask the forum for the category again next time
+            raise
+        here = [thread for thread in threads if thread.category_id == category]
+        if threads and not here:
+            self.refresh = True
+            raise _EpnError(
+                "the forum answered with threads from other categories",
+                detail="I asked for the threads of the Patch Notes category and got threads from other categories. If ESO_PATCH_NOTES_CATEGORY_ID is set in bot.py, check that it is the right number.",
+                topic="category",
+            )
+        return here
+
+    async def poll(self) -> None:
+        if self.polling:  # a check is already running: never run two at once
+            log.debug("Patch Notes watcher: a check is already running")
+            return
+        self.polling = True
+        try:
+            try:
+                threads = await self._read()
+            except _EpnError as error:
+                await self._failed(error)
+                return
+            await self._recovered()
+            await self._process(threads)
+        finally:
+            self.polling = False
+
+    async def _failed(self, error: _EpnError) -> None:
+        self.fails += 1
+        if error.wait:
+            self.wait_until = max(self.wait_until, _epn_mono() + error.wait)
+        if self.fails == 1:
+            log.warning("Patch Notes watcher: the check failed (%s). Nothing is announced from a failed check.", error.kind)
+        elif self.fails % 30 == 0:
+            log.warning("Patch Notes watcher: still failing after %d checks in a row (%s).", self.fails, error.kind)
+        if self.fails < _EPN_FAILS_BEFORE_WARNING:
+            return
+        if error.topic == "category":
+            title, body = "can't find the Patch Notes category", error.detail
+            body += " To fix it, set ESO_PATCH_NOTES_CATEGORY_ID in bot.py to the number of the right category."
+        elif error.topic == "shape":
+            title = "the forum's answer looks different"
+            body = f"{self.fails} checks in a row gave an answer I don't recognise ({error.kind}). The forum may have changed how it answers."
+        else:
+            title = "the ESO forum can't be read"
+            body = f"{self.fails} checks in a row failed. Latest: **{error.kind}**."
+        text = f"⚠️ **Patch Notes watcher · {title}** · {_eso_when(_epn_now())}\n{body}\nNew patch notes are not announced until this works."
+        if await self._warn(error.topic, text):
+            self.warned_fail = True
+
+    async def _recovered(self) -> None:
+        if not self.fails:
+            return
+        log.info("Patch Notes watcher: the forum can be read again after %d failed check(s).", self.fails)
+        was_warned, count = self.warned_fail, self.fails
+        self.fails, self.warned_fail = 0, False
+        for topic in ("read", "category", "shape"):  # (a warning about posting is not ended by being able to read)
+            self.warned.pop(topic, None)
+        if was_warned:
+            await self._say(f"✅ **Patch Notes watcher · the ESO forum can be read again** · {_eso_when(_epn_now())}\n{count} checks in a row had failed.")
+
+    async def _process(self, threads: List[_EpnThread]) -> None:
+        now = _epn_now()
+        ordered = sorted(threads, key=lambda thread: (thread.posted.timestamp() if thread.posted is not None else 0.0, thread.ident))
+        if self.seen is None:
+            await self._first_look(ordered, now)
+            return
+        known = set(self.seen)
+        skipped = False
+        announced = 0
+        for thread in ordered:
+            if thread.ident in known:
+                continue
+            if thread.posted is not None and (now - thread.posted).total_seconds() > _EPN_MAX_AGE:
+                log.info("Patch Notes watcher: not announcing “%s” (thread %d): it was posted more than a week ago.", thread.title, thread.ident)
+                self._mark(thread.ident)
+                skipped = True
+                continue
+            if announced >= _EPN_MAX_PER_RUN:
+                log.warning("Patch Notes watcher: more than %d new threads at once; the rest are announced at the next checks.", _EPN_MAX_PER_RUN)
+                break
+            outcome = await self._announce(thread)
+            if outcome == "later":
+                break  # keep the order: nothing newer goes out before this one
+            await self._save(now)  # remembered at once, so nothing that goes wrong later can make a restart announce it again
+            skipped = False  # (that save included any thread skipped before it)
+            announced += outcome == "sent"
+        if skipped:
+            await self._save(now)
+
+    async def _first_look(self, ordered: List[_EpnThread], now: datetime) -> None:
+        """The very first look: every thread already there is taken as seen, except the newest one if it is young enough to
+        be announced (see ESO_PATCH_NOTES_FIRST_RUN_HOURS). Then the owner is told what was found."""
+        newest = ordered[-1] if ordered else None
+        self.seen = [thread.ident for thread in ordered]
+        pending: Optional[_EpnThread] = None
+        window = _epn_first_run_seconds()
+        if newest is not None and window and newest.posted is not None and -300 <= (now - newest.posted).total_seconds() <= window:
+            pending = newest
+            self.seen.remove(newest.ident)
+        await self._save(now)  # the starting point is saved before anything is posted
+        log.info("Patch Notes watcher: the starting point is set (%d thread(s) already there; nothing older is announced).", len(ordered))
+        outcome = ""
+        if pending is not None:
+            log.info("Patch Notes watcher: the newest thread, “%s”, is under %d hours old, so it is announced now.", pending.title, int(window // 3600))
+            outcome = await self._announce(pending)
+            if outcome != "later":
+                await self._save(now)
+        await self._say_first_look(ordered, pending, outcome)
+
+    async def _say_first_look(self, ordered: List[_EpnThread], pending: Optional[_EpnThread], outcome: str) -> None:
+        newest = ordered[-1] if ordered else None
+        lines = [
+            f"🔎 **Patch Notes watcher · first look** · {_eso_when(_epn_now())}",
+            f"I can read the ESO forum. The Patch Notes category is number {self.category_id}, and I looked at its newest {len(ordered)} thread(s).",
+        ]
+        if newest is not None:
+            when = f" (posted {_eso_when(newest.posted)})" if newest.posted is not None else ""
+            lines.append(f"Newest thread: “{_epn_safe(newest.title)}”{when}.")
+            lines.append(f"<{newest.url}>")
+        if pending is not None and outcome == "sent":
+            lines.append(f"I announced that thread in {self.where}, because it is less than {int(_epn_first_run_seconds() // 3600)} hours old.")
+        elif pending is not None and outcome == "later":
+            lines.append("I could not announce that thread yet (see the log); I will try again at the next check.")
+        elif pending is not None:
+            lines.append("Discord refused that thread's announcement, so it was skipped.")
+        else:
+            lines.append(f"Nothing was announced. From now on, each new thread there is announced in {self.where}.")
+        await self._say("\n".join(lines))
+
+    # ----- announcing -------------------------------------------------------
+
+    async def _announce(self, thread: _EpnThread) -> str:
+        """Post one thread in the one allowed channel. "sent": posted. "gave up": Discord refused it too many times, so it is
+        skipped for good. "later": it could not be posted now and is tried again at the next check."""
+        now = _epn_mono()
+        self.sent = [moment for moment in self.sent if now - moment < 3600]
+        if len(self.sent) >= _EPN_MAX_PER_HOUR:
+            self._note(
+                "hour", logging.WARNING,
+                "Patch Notes watcher: holding back “%s”: %d announcements were already made in the last hour; it is announced when the hour allows.",
+                thread.title, _EPN_MAX_PER_HOUR,
+            )
+            return "later"
+        self.noted.discard("hour")
+        mode, _, _ = _esom_target()
+        channel, problem = await _esom_destination(self.bot, mode)
+        if channel is None:
+            self._note("dest:" + problem, logging.WARNING, "Patch Notes watcher: not announcing “%s” yet: %s.", thread.title, problem)
+            self.blocked += 1
+            if self.blocked >= _EPN_FAILS_BEFORE_WARNING:
+                await self._warn("destination", "\n".join([
+                    f"⚠️ **Patch Notes watcher · I can't post announcements** · {_eso_when(_epn_now())}",
+                    f"A new thread is waiting, but I can't use the announcement channel: {problem}.",
+                    "It is announced as soon as that is fixed.",
+                ]))
+            return "later"
+        self.blocked = 0
+        self.noted = {key for key in self.noted if not key.startswith("dest:")}
+        refused = ""
+        try:
+            await asyncio.wait_for(channel.send(embed=_epn_embed(thread), allowed_mentions=discord.AllowedMentions.none()), _EPN_SEND_TIMEOUT)
+        except asyncio.TimeoutError:
+            refused = "Discord took too long to accept it"
+        except discord.HTTPException as error:
+            refused = f"Discord refused it (HTTP {getattr(error, 'status', '?')})"
+        if not refused:
+            self.sent.append(now)
+            self._mark(thread.ident)
+            self.tries.pop(thread.ident, None)
+            log.info("Patch Notes watcher: announced “%s” (thread %d).", thread.title, thread.ident)
+            return "sent"
+        self.tries[thread.ident] = self.tries.get(thread.ident, 0) + 1
+        if self.tries[thread.ident] < _EPN_SEND_TRIES:
+            log.error("Patch Notes watcher: could not announce “%s” (thread %d): %s. It is tried again at the next check.", thread.title, thread.ident, refused)
+            return "later"
+        log.error("Patch Notes watcher: giving up on announcing “%s” (thread %d): %s, %d times.", thread.title, thread.ident, refused, _EPN_SEND_TRIES)
+        self._mark(thread.ident)
+        self.tries.pop(thread.ident, None)
+        await self._warn(f"gave up {thread.ident}", "\n".join([
+            f"⚠️ **Patch Notes watcher · I couldn't post a thread** · {_eso_when(_epn_now())}",
+            f"“{_epn_safe(thread.title)}” could not be announced: {refused}, {_EPN_SEND_TRIES} times. It is skipped.",
+            f"<{thread.url}>",
+        ]))
+        return "gave up"
+
+    # ----- the loop ---------------------------------------------------------
+
+    def delay(self) -> float:
+        """Seconds until the next check: the interval, doubling while checks keep failing (up to a limit), and never sooner than a
+        wait the forum asked for."""
+        if self.fails <= 1:
+            base = self.interval
+        else:
+            base = min(self.interval * 2 ** min(self.fails - 1, 20), max(self.interval, _EPN_BACKOFF_CAP))  # (20: far past the limit, but no overflow)
+        return max(base, self.wait_until - _epn_mono())
+
+    async def _sleep(self, seconds: float) -> None:
+        """Sleep in short slices so the watcher notices at once that the bot is shutting down."""
+        end = _epn_mono() + seconds
+        while not self.bot.is_closed():
+            left = end - _epn_mono()
+            if left <= 0:
+                return
+            await asyncio.sleep(min(left, _EPN_SLEEP_SLICE))
+
+    async def run(self) -> None:
+        try:
+            await self.bot.wait_until_ready()
+            log.info("Patch Notes watcher started: checking the ESO forum every %s seconds.", self.interval)
+            try:
+                self.restore()
+            except Exception:
+                log.exception("Patch Notes watcher: its saved list could not be used; the first look sets a new starting point")
+                self.seen, self.category_id = None, 0
+            try:
+                await self.check_destination()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Patch Notes watcher: could not check where announcements will go")
+            while not self.bot.is_closed():
+                try:
+                    await self.poll()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Patch Notes watcher: unexpected error (it keeps going)")
+                await self._sleep(self.delay())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Patch Notes watcher stopped because of an unexpected error")
+        finally:
+            log.info("Patch Notes watcher stopped")
+
+
+_epn_task: Optional[asyncio.Task] = None
+
+
+@bot.listen("on_ready")
+async def eso_patch_notes_ready():
+    """Start the watcher once. on_ready fires again after every reconnect, so a watcher that is already running is kept."""
+    global _epn_task
+    try:
+        if not _EPN_ENABLED:
+            log.info("Patch Notes watcher is switched off (the ESO_PATCH_NOTES setting is off).")
+        elif _epn_task is None or _epn_task.done():
+            problem = _esom_config_problem()
+            if problem:
+                log.warning("Patch Notes watcher is off, and nothing will be announced anywhere: %s.", problem)
+            else:
+                _epn_task = asyncio.create_task(_EpnWatcher(bot, _EPN_INTERVAL, _EPN_STATE_FILE).run(), name="eso-patch-notes")
+    except Exception:
+        log.exception("The Patch Notes watcher could not be started")
+
+
+# --------------------------------------------------------------------------
 # Error handling
 # --------------------------------------------------------------------------
 
