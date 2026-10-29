@@ -2032,9 +2032,9 @@ def _tkl_access_embed(member: discord.Member, moderator: Any) -> discord.Embed:
     return discord.Embed(
         title="Choose an access level",
         description=(
-            f"Verifying **{name}**. Pick which role to give them -- nothing is changed until you do.\n\n"
-            "🟢 **Full Access** -- removes Unverified, gives The Kings Legion role (full server access).\n"
-            "🔴 **Limited Access** -- removes Unverified, gives the Limited Access role (voice channels only).\n\n"
+            f"Verifying **{name}**. Pick which access level to give them -- nothing is changed until you do.\n\n"
+            "🟢 **Full Access** -- unlocks the full server: all channels, voice included, except the Officer channels.\n"
+            "🔴 **Limited Access** -- unlocks voice channels only: every other channel stays hidden.\n\n"
             f"Only {discord.utils.escape_markdown(moderator.display_name)} can answer this, and it expires "
             f"after {_TKL_ACCESS_TIMEOUT} seconds if nobody picks."
         ),
@@ -5661,7 +5661,6 @@ def _esom_status_embed(region: str, reading: Optional[_EsomReading], fresh: bool
         lines.append(f"❓ I couldn’t check the {label} server just now, so I can’t say whether it is up or down.")
         if reading is not None:
             lines.append(f"My last successful check was {_fmt_relative(reading.at)} ({reading.at:%H:%M:%S} UTC), which is too long ago to rely on.")
-    lines.append(f"Source: [ESO Server Status]({_ESOM_LINK})")
     embed = discord.Embed(title="Server status", url=_ESOM_LINK, description="\n".join(lines), colour=discord.Colour(colour))
     embed.set_footer(text=_esom_footer(region))
     return embed
@@ -6494,31 +6493,48 @@ async def roster(interaction: discord.Interaction):
 #
 # What it does
 #   Every few minutes it asks the ESO forum for the newest threads in the Patch Notes category
-#   (https://forums.elderscrollsonline.com/en/categories/patch-notes) and announces each NEW thread once, with a link and the
-#   first lines of the post, in the same channel as the Xbox status announcements. The announcement is the thread's title as a
-#   link, with a 📜 in front and a blue bar, or a 🔧 and an orange bar when the title says hotfix. Only threads are watched, not
-#   replies to older threads. A hotfix is announced like any other thread in that category. For threads that were already there
-#   when it first started it posts nothing, except the single newest one if it is younger than ESO_PATCH_NOTES_FIRST_RUN_HOURS,
-#   so that a post made just before the bot started is not lost.
+#   (https://forums.elderscrollsonline.com/en/categories/patch-notes) and announces each NEW thread once, in the same channel as
+#   the Xbox status announcements. The announcement is the thread's title as a link, with a 📜 in front and a blue bar, or a 🔧 and
+#   an orange bar when the title says hotfix, and under it the start of the post as the forum has it: paragraphs, lists, bold
+#   words and links stay (links stay clickable). Only threads are watched, not replies to older threads. A hotfix is announced like
+#   any other thread in that category. For threads that were already there when it first started it posts nothing, except the
+#   single newest one if it is younger than ESO_PATCH_NOTES_FIRST_RUN_HOURS, so that a post made just before the bot started is not
+#   lost.
 #
 # Where it reads
 #   The forum's own API, https://forums.elderscrollsonline.com/api/v2/..., the same data the forum's pages are built from.
 #   Nothing here logs in and nothing is ever written to the forum. It talks to that one address only, over https (a redirect
 #   anywhere else counts as a failed check), about once every ESO_PATCH_NOTES_INTERVAL_SECONDS (300 unless changed), and
-#   waits longer while the forum keeps failing or asks to be left alone (HTTP 429 with a Retry-After).
+#   waits longer while the forum keeps failing or asks to be left alone (HTTP 429 with a Retry-After). When it announces a
+#   thread it also asks for that one thread (/discussions/<number>) to get its whole post; if that fails it uses the start of the
+#   post that came with the list.
 #   The category is found by asking the forum for its list of categories and taking the one whose address name is
 #   "patch-notes"; its number is then kept in the saved file. ESO_PATCH_NOTES_CATEGORY_ID (just below) skips that look-up.
 #
-# Where it posts
+# Where it posts, and who is pinged
 #   Wherever the Xbox status announcements go (_esom_target and _esom_destination): while ESO_STATUS_LIVE is on, the main
 #   server's announcement channel (ESO_STATUS_MAIN_CHANNEL_ID), otherwise the test channel. If that place doesn't check out,
-#   nothing is posted and the log says why. An announcement never pings anyone.
+#   nothing is posted and the log says why.
+#   Every announcement pings the Patch Notes role (ESO_PATCH_NOTES_ROLE_ID) the way the Xbox status announcements ping theirs:
+#   the message's text is just the role's mention, above the embed, and Discord is told that this one role may be pinged and
+#   nobody else (no @everyone, no @here, no members, no other role). The role is checked in the channel's own server first (it
+#   exists, is not the @everyone role, and is mentionable, or the bot has Mention Everyone in that channel). If a check fails the
+#   announcement is posted without a ping and the log says why. In the test server nobody is pinged unless ESO_STATUS_TEST_PINGS
+#   is on, exactly as for the status announcements. At start-up the log says whether the role is going to be pinged.
+#
+# A one-time repost (to check how an announcement looks)
+#   ESO_PATCH_NOTES_REPOST_THREAD is the number of one thread that was announced earlier (the Oct. 28 hotfix, 700640). At the first
+#   check after a start the watcher posts it once more, as a preview: in the test channel, with a line saying that it is a repost,
+#   and with no ping, so nobody is bothered. If the setting ESO_PATCH_NOTES_REPOST_LIVE is on (in the host's settings, like
+#   ESO_STATUS_LIVE), it is posted instead in the announcement channel exactly like a new thread, ping included. A preview and a
+#   live repost are each done once: the saved file keeps a note of it, so a restart doesn't repeat it. 0 = no repost.
 #
 # What it remembers
-#   A small file (/data/eso_patch_notes_state.json on FadeHost): the number of the category and the numbers of the threads it
-#   has dealt with. A thread is added when it has been announced (or skipped for being more than a week old), so a restart never
-#   repeats one, and a post that Discord refuses is tried again at the next check (three tries, then it is given up on and the
-#   owner is told). A file that can't be read is set aside, never overwritten, and the first look starts again.
+#   A small file (/data/eso_patch_notes_state.json on FadeHost): the number of the category, the numbers of the threads it has
+#   dealt with, and which reposts have been done. A thread is added when it has been announced (or skipped for being more than a
+#   week old), so a restart never repeats one, and a post that Discord refuses is tried again at the next check (three tries,
+#   then it is given up on and the owner is told). A file that can't be read is set aside, never overwritten, and the first look
+#   starts again.
 #
 # When something is wrong
 #   A check that fails (the forum is down, answers with an error, or gives an answer that doesn't look like threads) changes
@@ -6529,8 +6545,11 @@ async def roster(interaction: discord.Interaction):
 
 ESO_PATCH_NOTES_CATEGORY_ID = 0  # 0 = find the Patch Notes category by itself (recommended); otherwise the forum's own number for it
 ESO_PATCH_NOTES_FIRST_RUN_HOURS = 36  # at the very first start, announce the newest thread if it is younger than this many hours (0 = announce nothing then)
+ESO_PATCH_NOTES_ROLE_ID = 1565324559320748122  # the Patch Notes role, pinged above every announcement (0 = ping nobody)
+ESO_PATCH_NOTES_REPOST_THREAD = 700640  # a thread announced earlier that is posted once more, to check how it looks (0 = none)
 
 _EPN_ENABLED = _esom_flag("ESO_PATCH_NOTES", True)  # off switches the whole watcher off
+_EPN_REPOST_LIVE = _esom_flag("ESO_PATCH_NOTES_REPOST_LIVE", False)  # on: the repost goes to the announcement channel, ping included; off: a preview in the test channel, no ping
 try:
     _EPN_INTERVAL = min(3600, max(120, int(os.environ.get("ESO_PATCH_NOTES_INTERVAL_SECONDS", "300"))))
 except ValueError:
@@ -6562,13 +6581,39 @@ _EPN_FAILS_BEFORE_WARNING = 3  # failed checks in a row before the owner is warn
 _EPN_WARN_EVERY = 3600  # seconds; the same kind of warning is not repeated sooner than this
 _EPN_BACKOFF_CAP = 900  # seconds; the longest wait between checks while the forum keeps failing
 _EPN_SLEEP_SLICE = 5  # seconds; the watcher sleeps in slices this long so it notices at once that the bot is closing
-_EPN_TEASER_CHARS = 400  # how much of the post is shown under the title
+_EPN_TEASER_CHARS = 1000  # how much of the post is shown under the title
+_EPN_POST_CHARS = 60000  # how much of a whole post is read (anything after that is ignored)
+_EPN_LIST_CHARS = 8000  # and how much of the post text that comes with the list of threads
 _EPN_BLUE, _EPN_ORANGE = 0x3498DB, 0xE67E22  # patch notes, hotfix
+_EPN_REPOSTED_KEEP = 50  # how many notes about reposts already done are remembered
+_EPN_REPOST_KEY = re.compile(r"[0-9]{1,12}:(?:live|preview)")  # the shape of such a note: the thread's number, a colon, and which kind of repost it was
+_EPN_PREVIEW_NOTE = "🧪 **PREVIEW**: this thread was announced before. It is posted again only so you can check how it looks. Nobody is pinged."
 _EPN_HOTFIX = re.compile(r"\bhot[\s\-]*fix", re.IGNORECASE)
 # Characters that are never wanted in text taken from the forum: control characters, line and paragraph separators, and the
 # characters that can make text run backwards or hide other text.
 _EPN_CONTROL = re.compile("[\x00-\x1f\x7f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
-_EPN_BREAKS = re.compile(r"(?i)<\s*(?:br\s*/?|/\s*(?:p|div|li|ul|ol|h[1-6]|tr|blockquote))\s*>")
+_EPN_ZERO_WIDTH_SPACE = chr(0x200B)  # invisible; keeps two marks that touch each other apart
+_EPN_SPACES = re.compile(r"\s+")
+_EPN_MARKS = re.compile(r"(?i)(https?://[^\s<>]+)|[\\*_~|`\[\]]")  # a web address (left alone) or a character Discord takes for a mark
+_EPN_TAG_NAME = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+_EPN_LOOKS_LIKE_HTML = re.compile(r"<[A-Za-z/!][^<>]{0,500}>")  # does the text have tags in it?
+_EPN_LOOKS_LIKE_URL = re.compile(r"(?i)(?:https?://|www\.)\S+")  # words that are themselves a web address
+_EPN_ATTRIBUTE = re.compile(r"""([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?""")  # one attribute of a tag: its name and, if it has one, its value
+_EPN_SCHEME = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*):")  # the scheme an address starts with (https:, mailto:, tel:, ...)
+_EPN_NO_BULLETS = re.compile(r"(?i)list-style(?:-type)?\s*:\s*none")
+_EPN_LINE_STARTS = ("#", ">", "-#")  # what a line may not start with, or Discord would not show it as the words it is
+_EPN_BOLD, _EPN_ITALIC = frozenset(("b", "strong")), frozenset(("i", "em", "cite", "dfn", "var"))
+_EPN_UNDERLINE, _EPN_STRIKE = frozenset(("u", "ins")), frozenset(("s", "strike", "del"))
+_EPN_CODE, _EPN_HEADINGS = frozenset(("code", "kbd", "samp", "tt")), frozenset(("h1", "h2", "h3", "h4", "h5", "h6"))
+_EPN_BLOCKS = frozenset((  # tags that start and end a line
+    "div", "section", "article", "aside", "header", "footer", "main", "nav", "figure", "figcaption", "blockquote", "pre", "table",
+    "thead", "tbody", "tfoot", "tr", "dl", "dt", "dd", "center", "form", "fieldset", "address", "details", "summary", "hr",
+))
+_EPN_DROPPED = frozenset((  # tags dropped together with everything inside them
+    "script", "style", "head", "title", "template", "noscript", "svg", "iframe", "object", "button", "select", "textarea",
+    "audio", "video", "canvas", "map",
+))
+_EPN_DROPPED_END = {name: re.compile(r"(?i)</" + name + r"\s*>") for name in _EPN_DROPPED}
 
 
 def _epn_now() -> datetime:
@@ -6767,53 +6812,438 @@ def _epn_clean(value: Any, limit: int) -> str:
     return text
 
 
-def _epn_strip_tags(text: str) -> str:
-    """The text without its <tags>. One pass, so odd or hostile markup can't make it slow. A "<" that doesn't start a tag (as in
-    "1 < 2") stays; a tag that is never closed takes the rest of the text with it."""
-    parts: List[str] = []
-    pos = 0
-    while True:
-        start = text.find("<", pos)
-        if start < 0:
-            parts.append(text[pos:])
+# ----- the text of a post ------------------------------------------------------------------------------------------------
+
+def _epn_escape(text: str) -> str:
+    """Words from a post made harmless for Discord: pings defused, and every character Discord would take for a mark written so that
+    it shows as it is. Web addresses are left alone, because a backslash inside one would break the link. (One pass over the text:
+    the library's own escape_markdown can take very long on a long run of some characters, so it isn't used on a whole post.)"""
+    return _EPN_MARKS.sub(lambda found: found.group(1) or "\\" + found.group(0), discord.utils.escape_mentions(text))
+
+
+def _epn_link(href: str) -> str:
+    """A safe web address for a link in a post, or "" if it isn't an ordinary http(s) address. A short address on the forum itself
+    is made whole, and the forum's "you are leaving" page is skipped (the link goes straight to where that page leads)."""
+    value = _EPN_CONTROL.sub("", html.unescape(href)).strip()  # (like a browser: no tabs or line breaks inside an address)
+    if not value or value.startswith("#") or len(value) > 2000:
+        return ""
+    for _ in range(2):  # (the second time is for the address a "you are leaving" page points to)
+        scheme = _EPN_SCHEME.match(value)
+        if scheme and scheme.group(1).lower() not in ("http", "https"):  # (tel:, mailto:, javascript: and the like; older Pythons would otherwise take "tel:123" for a short address on the forum)
+            return ""
+        try:
+            parts = urllib.parse.urlsplit(urllib.parse.urljoin(_EPN_SITE + "/", value))
+            host, port = (parts.hostname or "").lower(), parts.port
+        except ValueError:
+            return ""
+        if host in _EPN_HOSTS and parts.path.rstrip("/").endswith("/leaving"):
+            target = urllib.parse.parse_qs(parts.query).get("target", [""])[0]
+            if target:
+                value = _EPN_CONTROL.sub("", target).strip()
+                continue
+        break
+    if parts.scheme not in ("http", "https") or parts.username is not None or parts.password is not None or port not in (None, 80, 443):
+        return ""
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.\-]*[a-z0-9])?", host):
+        return ""
+    url = urllib.parse.quote(urllib.parse.urlunsplit(parts), safe="%/:?#&=+,;@!$*'~-._", errors="ignore")  # (brackets, spaces and the like are written as %xx)
+    url = re.sub(r"@(?=everyone|here|[!&]?[0-9]{17,20})", "%40", url)  # (an @ that Discord would take for the start of a ping is written as %40, which means the same)
+    return url if len(url) <= 700 else ""
+
+
+def _epn_link_markdown(label: str, url: str) -> str:
+    """A link as Discord shows it: the words, clickable. A link that has no words, or whose words hold an address (often the same
+    address, cut short), is shown as the real address, which Discord makes clickable by itself."""
+    if not label or _EPN_LOOKS_LIKE_URL.search(label):
+        return url
+    if len(label) > 80:
+        label = label[:79].rstrip() + "…"
+    label = re.sub(r"([\\*_~|`\[\]])", r"\\\1", discord.utils.escape_mentions(label))
+    return f"[{label}]({url})"
+
+
+def _epn_styled(style: Tuple[int, ...], text: str) -> str:
+    """Words with the look the post gave them (bold, italic, underlined, struck through, or code), made harmless. The spaces at
+    the ends stay outside the marks, because Discord does not accept a mark that has a space inside it."""
+    core = text.strip(" ")
+    if not core:
+        return " " if text else ""
+    lead, trail = (" " if text.startswith(" ") else ""), (" " if text.endswith(" ") else "")
+    bold, italic, underline, strike, code = style
+    if code:
+        return lead + "`" + discord.utils.escape_mentions(core).replace("`", "'") + "`" + trail
+    body = _epn_escape(core)
+    if bold and italic:
+        body = "***" + body + "***"
+    elif bold:
+        body = "**" + body + "**"
+    elif italic:
+        body = "*" + body + "*"
+    if strike:
+        body = "~~" + body + "~~"
+    if underline:
+        body = "__" + body + "__"
+    return lead + body + trail
+
+
+def _epn_render_line(parts: List[Tuple[Any, ...]]) -> Tuple[str, str, List[Tuple[str, str]]]:
+    """One line of a post: (what is shown in Discord, the same words with no marks at all, the links in it as (words, address))."""
+    items: List[List[Any]] = []
+    for part in parts:  # (neighbouring words that look the same are written as one, so no marks are doubled)
+        if part[0] != "t":
+            items.append(list(part))
+        elif items and items[-1][0] == "t" and items[-1][1] == part[1]:
+            items[-1][2].append(part[2])
+        else:
+            items.append(["t", part[1], [part[2]]])
+    shown: List[str] = []
+    plain: List[str] = []
+    links: List[Tuple[str, str]] = []
+    after_space = True  # (the line starts as if a space had come before it, so a space at its start is dropped)
+    for item in items:
+        if item[0] == "t":
+            text = _EPN_SPACES.sub(" ", "".join(item[2]))
+            if after_space and text.startswith(" "):
+                text = text[1:]
+            if not text:
+                continue
+            after_space = text.endswith(" ")
+            plain.append(text)
+            piece = _epn_styled(item[1], text)
+        else:
+            label, url = item[1], item[2]
+            after_space = False
+            if url:
+                plain.append(label or url)
+                piece = _epn_link_markdown(label, url)
+                links.append((label, url))
+            elif label:  # (a link whose address can't be used: just its words)
+                plain.append(label)
+                piece = _epn_escape(label)
+            else:
+                continue
+        if shown and shown[-1][-1:] in ("*", "_", "~", "`") and piece[:1] == shown[-1][-1:]:
+            shown.append(_EPN_ZERO_WIDTH_SPACE)  # (two marks right next to each other would be read as one)
+        shown.append(piece)
+    return "".join(shown).rstrip(" "), "".join(plain).strip(), links
+
+
+def _epn_fit(plain: str, room: int) -> str:
+    """The start of some plain words, made harmless, in at most `room` characters and cut at a word."""
+    lead = "\\" if plain.startswith(_EPN_LINE_STARTS) else ""  # (Discord would make a line that starts with # a big heading, with -# small print, or with > a quote)
+    room -= len(lead)
+    if room < 1:
+        return ""
+    cut = plain[:room]
+    while cut:
+        excess = len(_epn_escape(cut)) - room
+        if excess <= 0:
             break
-        parts.append(text[pos:start])
-        after = text[start + 1:start + 2]
-        if after and (after.isalpha() or after in "/!?"):
-            end = text.find(">", start + 1)
+        cut = cut[:max(0, len(cut) - (excess + 1) // 2)]  # (made harmless the words get longer, so take away what doesn't fit)
+    space = cut.rfind(" ")
+    if len(cut) < len(plain) and space >= len(cut) // 2:  # (if the words were cut, they end at a whole word)
+        cut = cut[:space]
+    words = _epn_escape(cut.rstrip(" ,.;:-–—"))
+    return lead + words if words else ""
+
+
+class _EpnText:
+    """Turns the HTML of a post into text for a Discord embed: paragraphs, lists and line breaks stay, bold, italic, underlined and
+    struck-through words keep their look, and links stay clickable. Everything else is dropped. It builds the text one line at a
+    time, so that it can be cut at the end of a line and no mark is left open."""
+
+    def __init__(self) -> None:
+        self.lines: List[Tuple[str, str, List[Tuple[str, str]]]] = []  # (shown, plain, links) for each line; a blank line is ("", "", [])
+        self.cur: List[Tuple[Any, ...]] = []  # the line being built: ("t", look, words) and ("a", words, address)
+        self.look = [0, 0, 0, 0, 0]  # how many bold, italic, underline, strike-through and code tags are open
+        self.link: Optional[List[Any]] = None  # the link being read: [address ("" if unusable), words, characters so far]
+        self.lists: List[List[Any]] = []  # the lists that are open: [number of the last item, "ul" or "ol", whether it has bullets]
+        self.prefix = ""  # the bullet or number waiting for the first words of a list item
+        self.gap = False  # a blank line is wanted before the next line
+        self.cell = 0  # the number of table cells seen in this row
+        self.words: List[str] = []  # text read since the last tag, not yet taken in
+
+    # ----- words and lines ---------------------------------------------------
+
+    def text(self, value: str) -> None:
+        self.words.append(value)
+
+    def take_in(self) -> None:
+        """Take in the text read since the last tag, with the look the tags before it gave it."""
+        if not self.words:
+            return
+        value = _EPN_SPACES.sub(" ", _EPN_CONTROL.sub(" ", html.unescape("".join(self.words))))
+        self.words = []
+        if not value:
+            return
+        if self.link is not None:
+            if self.link[2] < 400:  # (the words of a link are only ever shown up to 80 characters)
+                self.link[1].append(value)
+                self.link[2] += len(value)
+            return
+        self.cur.append(("t", tuple(1 if count > 0 else 0 for count in self.look), value))
+
+    def flush(self) -> bool:
+        """Finish the line being built. False if there was nothing in it."""
+        self.take_in()
+        parts, self.cur = self.cur, []
+        shown, plain, links = _epn_render_line(parts)
+        if not plain:
+            return False
+        if shown.startswith(_EPN_LINE_STARTS):  # (Discord would make a line that starts with # a big heading, with -# small print, or with > a quote)
+            shown = "\\" + shown
+        if self.prefix:
+            shown, plain = self.prefix + shown, self.prefix + plain
+            self.prefix = ""
+        if self.gap and self.lines and self.lines[-1][0]:
+            self.lines.append(("", "", []))
+        self.gap = False
+        self.lines.append((shown, plain, links))
+        return True
+
+    def newline(self, paragraph: bool = False) -> None:
+        self.take_in()
+        if self.link is not None:  # (inside a link a line break is only a space)
+            self.link[1].append(" ")
+            return
+        self.flush()
+        if paragraph:
+            self.gap = True
+
+    def line_break(self) -> None:
+        self.take_in()
+        if self.link is not None:
+            self.link[1].append(" ")
+        elif not self.flush():  # (a second break in a row is a blank line)
+            self.gap = True
+
+    # ----- links and lists ---------------------------------------------------
+
+    def open_link(self, attrs: str) -> None:
+        if self.link is None:
+            href = ""
+            for found in _EPN_ATTRIBUTE.finditer(attrs):  # (the first attribute that is called href; the words href=... inside another attribute's value are not one)
+                if found.group(1).lower() == "href":
+                    href = found.group(2) or found.group(3) or found.group(4) or ""
+                    break
+            self.link = [_epn_link(href), [], 0]
+
+    def close_link(self) -> None:
+        if self.link is not None:
+            url, words, _ = self.link
+            self.link = None
+            self.cur.append(("a", " ".join("".join(words).split()), url))
+
+    def open_item(self, attrs: str) -> None:
+        if self.link is not None:
+            return
+        top = self.lists[-1] if self.lists else [0, "ul", True]
+        top[0] += 1
+        indent = "  " * max(0, len(self.lists) - 1)
+        if not top[2] or _EPN_NO_BULLETS.search(attrs):
+            self.prefix = indent
+        else:
+            self.prefix = indent + (f"{top[0]}. " if top[1] == "ol" else "• ")
+
+    # ----- the tags ----------------------------------------------------------
+
+    def open(self, name: str, attrs: str) -> None:
+        self.take_in()
+        if name == "br":
+            self.line_break()
+        elif name in _EPN_BOLD:
+            self.look[0] += 1
+        elif name in _EPN_ITALIC:
+            self.look[1] += 1
+        elif name in _EPN_UNDERLINE:
+            self.look[2] += 1
+        elif name in _EPN_STRIKE:
+            self.look[3] += 1
+        elif name in _EPN_CODE:
+            self.look[4] += 1
+        elif name == "a":
+            self.open_link(attrs)
+        elif name == "p":
+            self.newline(not self.lists)
+        elif name in _EPN_HEADINGS:
+            self.newline(True)
+            self.look[0] += 1
+        elif name in ("ul", "ol"):
+            self.newline()
+            self.lists.append([0, name, not _EPN_NO_BULLETS.search(attrs)])
+        elif name == "li":
+            self.newline()
+            self.open_item(attrs)
+        elif name in ("td", "th"):
+            if self.cell:
+                self.text(" · ")
+            self.cell += 1
+        elif name == "tr":
+            self.newline()
+            self.cell = 0
+        elif name in _EPN_BLOCKS:
+            self.newline(name == "hr")
+
+    def close(self, name: str) -> None:
+        self.take_in()
+        if name in _EPN_BOLD:
+            self.look[0] = max(0, self.look[0] - 1)
+        elif name in _EPN_ITALIC:
+            self.look[1] = max(0, self.look[1] - 1)
+        elif name in _EPN_UNDERLINE:
+            self.look[2] = max(0, self.look[2] - 1)
+        elif name in _EPN_STRIKE:
+            self.look[3] = max(0, self.look[3] - 1)
+        elif name in _EPN_CODE:
+            self.look[4] = max(0, self.look[4] - 1)
+        elif name == "a":
+            self.close_link()
+        elif name == "p":
+            self.newline(not self.lists)
+        elif name in _EPN_HEADINGS:
+            self.look[0] = max(0, self.look[0] - 1)
+            self.newline()
+        elif name in ("ul", "ol"):
+            if self.lists:
+                self.lists.pop()
+            self.newline()
+            self.prefix = ""
+        elif name == "li":
+            self.newline()
+            self.prefix = ""
+        elif name in _EPN_BLOCKS:
+            self.newline()
+
+    # ----- reading ----------------------------------------------------------
+
+    def feed_html(self, source: str) -> None:
+        """Read HTML in one pass from start to end, so odd or hostile markup can't make it slow. A "<" that doesn't start a tag
+        (as in "1 < 2") is text, and a tag that is never closed takes the rest of the post with it."""
+        size = len(source)
+        pos = 0
+        while pos < size:
+            start = source.find("<", pos)
+            if start < 0:
+                self.text(source[pos:])
+                break
+            if start > pos:
+                self.text(source[pos:start])
+            marker = source[start + 1:start + 2]
+            if marker in ("!", "?"):  # a comment, or a doctype or the like: dropped
+                if source.startswith("<!--", start):
+                    end = source.find("-->", start + 4)
+                    pos = size if end < 0 else end + 3
+                else:
+                    end = source.find(">", start + 1)
+                    pos = size if end < 0 else end + 1
+                continue
+            closing = marker == "/"
+            named = _EPN_TAG_NAME.match(source, start + (2 if closing else 1))
+            if named is None:
+                self.text("<")
+                pos = start + 1
+                continue
+            end = source.find(">", named.end())
             if end < 0:
                 break
+            name = named.group().lower()
             pos = end + 1
+            if closing:
+                self.close(name)
+            elif name in _EPN_DROPPED:  # (scripts, styles and the like: dropped with everything inside them)
+                after = _EPN_DROPPED_END[name].search(source, pos)
+                pos = size if after is None else after.end()
+            else:
+                self.open(name, source[named.end():min(end, named.end() + 4000)])
+
+    def feed_plain(self, source: str) -> None:
+        """Read text that has no tags: each of its lines is a line."""
+        for line in source.split("\n"):
+            self.text(line)
+            self.line_break()
+
+    def result(self, limit: int) -> str:
+        """The text, in at most `limit` characters (plus, if it had to be cut, a line that lists the links in what was cut off).
+        It is cut at the end of a line where it can be; the start of a line that is too long is shown as plain words."""
+        self.take_in()
+        self.close_link()
+        self.flush()
+        lines = self.lines
+        while lines and not lines[-1][0]:
+            lines.pop()
+        if not lines:
+            return ""
+        if sum(len(line[0]) + 1 for line in lines) - 1 <= limit:
+            return "\n".join(line[0] for line in lines)
+        room = max(1, limit - 2)  # (what is kept leaves room for the " …" that ends it)
+        kept = 0
+        used = 0
+        while kept < len(lines) and used + len(lines[kept][0]) + (1 if kept else 0) <= room:
+            used += len(lines[kept][0]) + (1 if kept else 0)
+            kept += 1
+        while kept and not lines[kept - 1][0]:  # (no blank line at the end of what is kept)
+            kept -= 1
+            used -= len(lines[kept][0]) + (1 if kept else 0)
+        shown = [line[0] for line in lines[:kept]]
+        following = kept
+        while following < len(lines) and not lines[following][0]:
+            following += 1
+        gap = bool(shown) and following > kept  # (a blank line came between what is kept and the next line, and stays)
+        left = room - used - (1 if gap else 0) if shown else limit - 1  # (the room that is left, after the lines that are kept, for the start of the next line)
+        start = _epn_fit(lines[following][1], left) if following < len(lines) and (not shown or left >= limit // 4) else ""
+        if start:
+            shown.extend(("", start + "…") if gap else (start + "…",))
+        elif shown:
+            shown[-1] += " …"
         else:
-            parts.append("<")
-            pos = start + 1
-    return "".join(parts)
+            shown.append("…")
+        text = "\n".join(shown)
+        seen = {url for line in lines[:kept] for _, url in line[2]}  # the links that are still there...
+        more: List[str] = []
+        for line in lines[kept:]:  # ...and the ones in what was cut off, which are listed so they are not lost
+            for label, url in line[2]:
+                if url not in seen:
+                    seen.add(url)
+                    entry = _epn_link_markdown(label, url)
+                    if len(entry) <= 350:
+                        more.append(entry)
+        if more:
+            text += "\n\n🔗 " + " · ".join(more[:3])
+        return text
 
 
-def _epn_plain(raw: str, limit: int) -> str:
-    """The readable start of a post that the forum gave as HTML: line breaks kept (one per paragraph), tags gone, character codes
-    turned into characters, cut to `limit` characters at a word."""
-    text = html.unescape(_epn_strip_tags(_EPN_BREAKS.sub("\n", raw[:20000])))
-    lines = [" ".join(_EPN_CONTROL.sub(" ", line).split()) for line in text.split("\n")]
-    text = "\n".join(line for line in lines if line)
-    if len(text) > limit:
-        room = max(1, limit - 1)  # (one character is kept for the "…")
-        cut = text[:room]
-        space = max(cut.rfind(" "), cut.rfind("\n"))
-        if space >= room // 2:
-            cut = cut[:space]
-        text = cut.rstrip(" \n,.;:-–—") + "…"
-    return text
+_epn_text_fault = False  # set once a post's text has failed to turn into Discord text, so the log isn't filled with the same fault
+
+
+def _epn_post_text(raw: Any, limit: int, read: int) -> str:
+    """The start of a post as text for a Discord embed (see _EpnText), in at most `limit` characters. `raw` is the post as the
+    forum gave it (HTML, or plain text); only its first `read` characters are looked at. Anything that isn't text, or has no
+    words in it, gives "". It never raises: a post it can't make sense of gives "" and is logged once."""
+    global _epn_text_fault
+    if not isinstance(raw, str):
+        return ""
+    try:
+        source = raw[:read]
+        converter = _EpnText()
+        if _EPN_LOOKS_LIKE_HTML.search(source):
+            converter.feed_html(source)
+        else:
+            converter.feed_plain(source)
+        return converter.result(limit)
+    except Exception:
+        if not _epn_text_fault:
+            _epn_text_fault = True
+            log.exception("Patch Notes watcher: the text of a post could not be turned into Discord text, so it is announced without it (logged once)")
+        return ""
 
 
 def _epn_teaser(item: Dict[str, Any]) -> str:
-    """The start of the post, for under the title: the forum's own short text if it sent one, otherwise the start of the post."""
-    for key in ("excerpt", "body"):
-        value = item.get(key)
-        if isinstance(value, str) and value.strip():
-            text = _epn_plain(value, _EPN_TEASER_CHARS)
-            if len(text) >= 20:
-                return text
+    """The start of the post for under the title, from what came with the list of threads: the post itself if there is one (it
+    keeps its bold words and links), otherwise the forum's own short text."""
+    for key in ("body", "excerpt"):
+        text = _epn_post_text(item.get(key), _EPN_TEASER_CHARS, _EPN_LIST_CHARS)
+        if len(text) >= 20:
+            return text
     return ""
 
 
@@ -6917,7 +7347,7 @@ def _epn_embed(thread: _EpnThread) -> Any:
     bar for anything else), the first lines of the post, and a footer in the same style as the Xbox status announcements. There is
     no heading above the title. Mentions in the forum's text are made harmless."""
     hotfix = bool(_EPN_HOTFIX.search(thread.title))
-    teaser = _epn_safe(thread.teaser)[:4096] if thread.teaser else None  # (Discord's limits: 256 for the title, 4096 for the text)
+    teaser = discord.utils.escape_mentions(thread.teaser)[:4096] if thread.teaser else None  # (Discord's limits: 256 for the title, 4096 for the text)
     embed = discord.Embed(
         title=_epn_clean(("🔧 " if hotfix else "📜 ") + thread.title, 256),
         url=thread.url,
@@ -6927,6 +7357,54 @@ def _epn_embed(thread: _EpnThread) -> Any:
     )
     embed.set_footer(text="Poss Bot watching [patch-notes]")
     return embed
+
+
+def _epn_pick_role(channel: Any, live: bool) -> Tuple[Optional[Any], str, bool]:
+    """The one role that may be pinged by an announcement, or (None, why not, whether that is a problem worth a warning). The same
+    checks as for the Xbox status pings (_esom_pick_role). `live` is whether the channel is in the main server: in the test server
+    nobody is pinged unless ESO_STATUS_TEST_PINGS is on."""
+    role_id = _esom_id(ESO_PATCH_NOTES_ROLE_ID)
+    if not role_id:
+        return None, "no ping role is set (ESO_PATCH_NOTES_ROLE_ID is 0)", False
+    if not live and not _ESOM_TEST_PINGS:
+        return None, "pings are switched off in the test server (ESO_STATUS_TEST_PINGS)", False
+    guild = channel.guild
+    role = guild.get_role(role_id)
+    if role is None:
+        return None, f"role {role_id} does not exist in this server", True
+    if role.id == guild.id:  # the @everyone role has the same ID as its server
+        return None, "that is the @everyone role", True
+    if not getattr(role, "mentionable", False):
+        me = getattr(guild, "me", None)
+        if me is None or not getattr(channel.permissions_for(me), "mention_everyone", False):
+            return None, f"role {role_id} is not mentionable and the bot does not have the Mention Everyone permission", True
+    return role, "", False
+
+
+def _epn_ping(role: Optional[Any]) -> Tuple[Optional[str], Any]:
+    """(text, allowed mentions) for one announcement, made the way the Xbox status announcements are (_esom_message). The text is
+    empty (None) unless a role is to be pinged. A ping is the role's mention and nothing else in the text, and the allowed
+    mentions allow that one role and nothing else: no @everyone, no @here, no members, no other role."""
+    if role is None:
+        return None, discord.AllowedMentions.none()
+    return f"<@&{role.id}>", discord.AllowedMentions(everyone=False, users=False, roles=[discord.Object(id=role.id)], replied_user=False)
+
+
+def _epn_reposted(value: Any) -> List[str]:
+    """The notes about reposts already done, as read from the saved file. Only notes of exactly the shape this code writes are
+    kept; anything else is ignored (the worst that can happen then is that a repost is done again)."""
+    if not isinstance(value, list):
+        return []
+    return [item for item in value[-_EPN_REPOSTED_KEEP:] if isinstance(item, str) and _EPN_REPOST_KEY.fullmatch(item)]
+
+
+def _epn_repost_due() -> Tuple[int, str]:
+    """(thread number, the note that is saved once it is done) for the repost the settings ask for, or (0, "") for none. A preview
+    and a live repost have different notes, so turning ESO_PATCH_NOTES_REPOST_LIVE on after a preview gives one live repost."""
+    ident = _esom_id(ESO_PATCH_NOTES_REPOST_THREAD)
+    if not ident:
+        return 0, ""
+    return ident, f"{ident}:{'live' if _EPN_REPOST_LIVE else 'preview'}"
 
 
 # ----- the saved file ---------------------------------------------------------------------------------------------------
@@ -6960,8 +7438,9 @@ class _EpnStore:
         return None
 
     def load(self) -> Optional[Dict[str, Any]]:
-        """{"category_id": number, "seen": [thread numbers]} from the saved file, or None if there is no usable file (the very
-        first start, or a file that was unreadable and has been set aside)."""
+        """{"category_id": number, "seen": [thread numbers], "reposted": [notes about reposts done]} from the saved file, or None if
+        there is no usable file (the very first start, or a file that was unreadable and has been set aside). A file saved before
+        reposts existed has no "reposted" and is fine; one that has it in a form that isn't understood just counts as none."""
         try:
             text = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -6978,7 +7457,7 @@ class _EpnStore:
                 raise ValueError("unexpected contents")
         except (ValueError, KeyError, TypeError, RecursionError) as error:
             return self._unusable(error)
-        return {"category_id": category, "seen": [_epn_int(value) for value in seen if _epn_int(value)]}
+        return {"category_id": category, "seen": [_epn_int(value) for value in seen if _epn_int(value)], "reposted": _epn_reposted(data.get("reposted"))}
 
     def _write(self, text: str) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -7017,6 +7496,8 @@ class _EpnWatcher:
         self.category_id = 0  # the Patch Notes category's number, once known (the list of seen threads below belongs to it)
         self.refresh = False  # True: ask the forum for the category's number again at the next check
         self.seen: Optional[List[int]] = None  # numbers of the threads already dealt with; None until the first look
+        self.reposted: List[str] = []  # notes about the reposts already done ("<thread number>:preview" or ":live"), kept in the saved file
+        self.preview_tries = 0  # how many times Discord has refused the preview in a row
         self.fails = 0  # checks in a row that gave no usable answer
         self.warned_fail = False  # a warning about failing checks has been sent, so a "can be read again" is owed
         self.blocked = 0  # checks in a row where an announcement was due but could not be posted for want of a usable channel
@@ -7044,10 +7525,11 @@ class _EpnWatcher:
             return
         self.seen = list(saved["seen"])
         self.category_id = saved["category_id"]
+        self.reposted = list(saved["reposted"])
         log.info("Patch Notes watcher: carrying on from the saved list (%d thread(s) already dealt with).", len(self.seen))
 
     async def check_destination(self) -> None:
-        """Say in the log, once at start-up, where announcements will go."""
+        """Say in the log, once at start-up, where announcements will go and whether a role will be pinged."""
         mode, _, _ = _esom_target()
         channel, problem = await _esom_destination(self.bot, mode)
         if channel is None:
@@ -7055,12 +7537,28 @@ class _EpnWatcher:
             return
         self.where = f"#{getattr(channel, 'name', '?')}"
         log.info("Patch Notes watcher: announcements go to #%s in “%s” (%s mode).", getattr(channel, "name", "?"), getattr(channel.guild, "name", "?"), mode)
+        role, why, serious = _epn_pick_role(channel, live=(mode == "live"))
+        if role is not None:
+            log.info("Patch Notes watcher: announcements will ping the role “%s”.", getattr(role, "name", role.id))
+        else:
+            log.log(logging.WARNING if serious else logging.INFO, "Patch Notes watcher: announcements will not ping anyone: %s.", why)
+
+    def say_repost_plan(self) -> None:
+        """Say in the log, once at start-up, whether a repost is going to be made."""
+        ident, note = _epn_repost_due()
+        if not ident:
+            return
+        how = "in the announcement channel like a new thread (ping included)" if _EPN_REPOST_LIVE else "as a preview in the test channel (nobody is pinged)"
+        if note in self.reposted:
+            log.info("Patch Notes watcher: thread %d has already been reposted %s; nothing is reposted.", ident, how)
+        else:
+            log.info("Patch Notes watcher: thread %d will be posted once more at the first check, %s.", ident, how)
 
     # ----- saving -----------------------------------------------------------
 
     async def _save(self, now: datetime) -> None:
         seen = sorted(self.seen or [], reverse=True)[:_EPN_SEEN_KEEP]
-        snapshot = {"version": 1, "saved_at": _iso(now), "category_id": self.category_id, "seen": seen}
+        snapshot = {"version": 1, "saved_at": _iso(now), "category_id": self.category_id, "seen": seen, "reposted": self.reposted[-_EPN_REPOSTED_KEEP:]}
         try:
             await self.store.save(snapshot)
         except OSError as error:
@@ -7220,6 +7718,12 @@ class _EpnWatcher:
                 await self._failed(error)
                 return
             await self._recovered()
+            try:
+                await self._repost(threads)  # (before the real announcements, so a thread announced at this very check is not reposted at once)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Patch Notes watcher: the repost failed unexpectedly (new threads are announced as usual)")
             await self._process(threads)
         finally:
             self.polling = False
@@ -7329,9 +7833,42 @@ class _EpnWatcher:
 
     # ----- announcing -------------------------------------------------------
 
+    async def _whole_post(self, thread: _EpnThread) -> None:
+        """Ask the forum for this one thread and use its post, with bold words, line breaks and links, as the announcement's text.
+        Only that answer is sure to carry the whole post (the list of threads may carry just a short plain text). If it doesn't
+        work, the text that came with the list is used. (While the forum has asked to be left alone, it is not asked.)"""
+        if _epn_mono() < self.wait_until:
+            return
+        try:
+            data = await _epn_fetch(f"/discussions/{thread.ident}")
+        except _EpnError as error:
+            if error.wait:
+                self.wait_until = max(self.wait_until, _epn_mono() + error.wait)
+            log.info("Patch Notes watcher: could not get the whole post of “%s” (%s), so the start that came with the list is used.", thread.title, error.kind)
+            return
+        body = data.get("body") if isinstance(data, dict) and _epn_int(data.get("discussionID")) == thread.ident else None
+        text = _epn_post_text(body, _EPN_TEASER_CHARS, _EPN_POST_CHARS)
+        if len(text) >= 20:
+            thread.teaser = text
+        else:
+            log.info("Patch Notes watcher: the forum's answer for “%s” had no post text I could use, so the start that came with the list is used.", thread.title)
+
+    async def _deliver(self, thread: _EpnThread, channel: Any, text: Optional[str], allowed: Any) -> str:
+        """Get the thread's whole post and send its announcement to `channel`, with `text` (a ping, a note or nothing) above the
+        embed and `allowed` saying who that text may reach. Returns "" if Discord accepted it, otherwise the reason it did not."""
+        await self._whole_post(thread)
+        try:
+            await asyncio.wait_for(channel.send(content=text, embed=_epn_embed(thread), allowed_mentions=allowed), _EPN_SEND_TIMEOUT)
+        except asyncio.TimeoutError:
+            return "Discord took too long to accept it"
+        except discord.HTTPException as error:
+            return f"Discord refused it (HTTP {getattr(error, 'status', '?')})"
+        return ""
+
     async def _announce(self, thread: _EpnThread) -> str:
-        """Post one thread in the one allowed channel. "sent": posted. "gave up": Discord refused it too many times, so it is
-        skipped for good. "later": it could not be posted now and is tried again at the next check."""
+        """Post one thread in the one allowed channel, pinging the Patch Notes role if it may be pinged there. "sent": posted.
+        "gave up": Discord refused it too many times, so it is skipped for good. "later": it could not be posted now and is tried
+        again at the next check."""
         now = _epn_mono()
         self.sent = [moment for moment in self.sent if now - moment < 3600]
         if len(self.sent) >= _EPN_MAX_PER_HOUR:
@@ -7356,18 +7893,16 @@ class _EpnWatcher:
             return "later"
         self.blocked = 0
         self.noted = {key for key in self.noted if not key.startswith("dest:")}
-        refused = ""
-        try:
-            await asyncio.wait_for(channel.send(embed=_epn_embed(thread), allowed_mentions=discord.AllowedMentions.none()), _EPN_SEND_TIMEOUT)
-        except asyncio.TimeoutError:
-            refused = "Discord took too long to accept it"
-        except discord.HTTPException as error:
-            refused = f"Discord refused it (HTTP {getattr(error, 'status', '?')})"
+        role, why, serious = _epn_pick_role(channel, live=(mode == "live"))
+        if role is None:
+            log.log(logging.WARNING if serious else logging.INFO, "Patch Notes watcher: “%s” is announced without a ping: %s.", thread.title, why)
+        text, allowed = _epn_ping(role)
+        refused = await self._deliver(thread, channel, text, allowed)
         if not refused:
             self.sent.append(now)
             self._mark(thread.ident)
             self.tries.pop(thread.ident, None)
-            log.info("Patch Notes watcher: announced “%s” (thread %d).", thread.title, thread.ident)
+            log.info("Patch Notes watcher: announced “%s” (thread %d)%s.", thread.title, thread.ident, " with a ping" if role is not None else "")
             return "sent"
         self.tries[thread.ident] = self.tries.get(thread.ident, 0) + 1
         if self.tries[thread.ident] < _EPN_SEND_TRIES:
@@ -7382,6 +7917,46 @@ class _EpnWatcher:
             f"<{thread.url}>",
         ]))
         return "gave up"
+
+    # ----- the one-time repost ------------------------------------------------
+
+    async def _preview(self, thread: _EpnThread) -> str:
+        """The checking copy of a repost: the thread's announcement in the test channel, with a line saying what it is and no ping.
+        Answers like _announce: "sent", "gave up" (Discord refused it too many times) or "later" (tried again at the next check).
+        It changes nothing about which threads count as dealt with, and the owner is not warned if it fails: the log says why."""
+        channel, problem = await _esom_destination(self.bot, "test")
+        if channel is None:
+            self._note("preview:" + problem, logging.WARNING, "Patch Notes watcher: the preview of “%s” waits, because the test channel can't be used: %s.", thread.title, problem)
+            return "later"
+        refused = await self._deliver(thread, channel, _EPN_PREVIEW_NOTE, discord.AllowedMentions.none())
+        if not refused:
+            self.preview_tries = 0
+            log.info("Patch Notes watcher: posted “%s” (thread %d) again as a preview in #%s, without a ping.", thread.title, thread.ident, getattr(channel, "name", "?"))
+            return "sent"
+        self.preview_tries += 1
+        if self.preview_tries < _EPN_SEND_TRIES:
+            log.error("Patch Notes watcher: could not post the preview of “%s”: %s. It is tried again at the next check.", thread.title, refused)
+            return "later"
+        log.error("Patch Notes watcher: giving up on the preview of “%s”: %s, %d times.", thread.title, refused, _EPN_SEND_TRIES)
+        self.preview_tries = 0
+        return "gave up"
+
+    async def _repost(self, threads: List[_EpnThread]) -> None:
+        """Post ESO_PATCH_NOTES_REPOST_THREAD once more (see "A one-time repost" at the top): as a preview in the test channel, or,
+        if ESO_PATCH_NOTES_REPOST_LIVE is on, in the announcement channel like a new thread. Only a thread that was announced
+        before and is among the newest ones just read. Once done it is noted in the saved file, so it is not done again."""
+        ident, note = _epn_repost_due()
+        if not ident or self.seen is None or note in self.reposted:
+            return
+        thread = next((candidate for candidate in threads if candidate.ident == ident), None)
+        if thread is None or ident not in self.seen:
+            why = "it is not among the newest threads of the category" if thread is None else "it has not been announced yet, so it will be announced as a new thread"
+            self._note("repost:" + note, logging.INFO, "Patch Notes watcher: thread %d is not reposted: %s.", ident, why)
+            return
+        outcome = await (self._announce(thread) if _EPN_REPOST_LIVE else self._preview(thread))
+        if outcome != "later":
+            self.reposted.append(note)
+            await self._save(_epn_now())
 
     # ----- the loop ---------------------------------------------------------
 
@@ -7418,6 +7993,10 @@ class _EpnWatcher:
                 raise
             except Exception:
                 log.exception("Patch Notes watcher: could not check where announcements will go")
+            try:
+                self.say_repost_plan()
+            except Exception:
+                log.exception("Patch Notes watcher: could not say whether a repost is planned")
             while not self.bot.is_closed():
                 try:
                     await self.poll()
