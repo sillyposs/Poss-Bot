@@ -18,6 +18,15 @@ Seven slash commands:
               Defaults to the channel the invoking member is connected to,
               or accepts an explicit channel argument.
 
+              Admins (anyone with Manage Server) are asked first, privately, whether /silence
+              should silence only @everyone (green) or the General role as well (red). Red also
+              switches the General role's own Speak setting in that channel to Deny, and
+              /unsilence puts it back; only an Admin can lift a silence that included the
+              Generals. Everyone else who can use /silence (the Generals) is asked nothing: it
+              silences @everyone exactly as before. See "/silence for Admins" further down.
+              Both commands answer in the channel, for everyone to see; only an Admin's green /
+              red choice is private.
+
   /unverified Lists the members who currently have the Unverified role, as
               plain-text display names (not clickable mentions, so nobody is
               pinged and the names always show correctly) with a count, in
@@ -128,6 +137,16 @@ STATE_FILE = Path(
 # Change this, or override it per-role from Server Settings -> Integrations
 # in Discord, to match how your server delegates voice moderation.
 REQUIRED_PERMISSION = "mute_members"
+
+# The General role. Looked up by ID, not name, so renaming it in Discord won't break anything.
+# An Admin who uses /silence is asked whether to silence this role as well (see the section
+# "/silence for Admins" further down).
+GENERAL_ROLE_ID = 1240321970747478148
+
+# The permission that makes someone an Admin for /silence and /unsilence: only people who have it are
+# offered the green / red choice in /silence, and only they can lift a silence that included the
+# Generals. Discord's name for it is "Manage Server".
+ADMIN_PERMISSION = "manage_guild"
 
 # Role whose members /unverified lists. It's looked up by ID, not name, so
 # renaming the role in Discord won't break the command.
@@ -302,6 +321,27 @@ class SilenceStore:
         async with self._lock:
             if str(channel_id) in self._data:
                 del self._data[str(channel_id)]
+                self._save()
+
+    # An Admin can also silence the Generals (see "/silence for Admins"). When that happens the channel's
+    # record gets one more part, "general", holding what the General role's own Speak setting was
+    # beforehand (previous_speak / had_overwrite, as above) so /unsilence can put it back. A record
+    # without "general" is a normal silence, exactly as before.
+    async def set_general(self, channel_id: int, previous_speak: Optional[bool], had_overwrite: bool) -> bool:
+        """Adds the "general" part to the channel's record. False if the channel has no record (any more)."""
+        async with self._lock:
+            record = self._data.get(str(channel_id))
+            if record is None:
+                return False
+            record["general"] = {"previous_speak": previous_speak, "had_overwrite": had_overwrite}
+            self._save()
+            return True
+
+    async def clear_general(self, channel_id: int) -> None:
+        async with self._lock:
+            record = self._data.get(str(channel_id))
+            if record is not None and "general" in record:
+                del record["general"]
                 self._save()
 
 
@@ -1378,7 +1418,10 @@ async def on_ready():
 @app_commands.checks.has_permissions(**{REQUIRED_PERMISSION: True})
 @app_commands.guild_only()
 async def silence(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    # The reply is public, so everyone can see the channel was silenced. The exception is an Admin: their
+    # first reply is the private green / red choice (see "/silence for Admins"), and the result is posted
+    # publicly once they have picked.
+    await interaction.response.defer(ephemeral=_silence_is_admin(interaction))
 
     member = interaction.user
     guild = interaction.guild
@@ -1403,6 +1446,12 @@ async def silence(interaction: discord.Interaction):
             "I don't have the **Manage Roles** permission in that channel, "
             "so I can't change its permissions. See README.md for the invite link."
         )
+        return
+
+    # An Admin (Manage Server) is asked first whether to silence the Generals too. Everyone else who can
+    # use /silence (the Generals) carries on below exactly as before.
+    if _silence_is_admin(interaction):
+        await _silence_choice(interaction, guild, member, channel)
         return
 
     everyone = guild.default_role
@@ -1470,7 +1519,8 @@ async def silence(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(**{REQUIRED_PERMISSION: True})
 @app_commands.guild_only()
 async def unsilence(interaction: discord.Interaction, channel: Optional[discord.VoiceChannel] = None):
-    await interaction.response.defer(ephemeral=True)
+    # The reply is public, so everyone can see the channel was unsilenced (and by whom).
+    await interaction.response.defer(ephemeral=False)
 
     member = interaction.user
     guild = interaction.guild
@@ -1505,6 +1555,23 @@ async def unsilence(interaction: discord.Interaction, channel: Optional[discord.
         )
         return
 
+    # If an Admin silenced the Generals too, their Speak setting is put back first, and only an Admin may
+    # do that (otherwise a General could undo it with one command). If that fails, nothing else is changed.
+    general_restored = False
+    saved_general = record.get("general")
+    if saved_general is not None:
+        if not _silence_is_admin(interaction):
+            await interaction.followup.send(
+                f"\U0001F512 {target_channel.mention} was silenced with the Generals included, "
+                f"so only someone with **Manage Server** can lift it."
+            )
+            return
+        problem = await _unsilence_generals(guild, target_channel, member, saved_general)
+        if problem is not None:
+            await interaction.followup.send(problem)
+            return
+        general_restored = True
+
     overwrite = target_channel.overwrites_for(everyone)
     overwrite.speak = record["previous_speak"]
 
@@ -1534,9 +1601,365 @@ async def unsilence(interaction: discord.Interaction, channel: Optional[discord.
         target_channel.name, target_channel.id, guild.name, member, record["previous_speak"],
     )
 
+    if general_restored:
+        # The silence included the Generals, so this one message says so (instead of the usual one below).
+        await interaction.followup.send(
+            f"\U0001F50A Restored **{target_channel.name}**'s Speak permission to its previous state "
+            f"for everyone, the Generals included."
+        )
+        return
+
     await interaction.followup.send(
         f"\U0001F50A Restored **{target_channel.name}**'s Speak permission to its previous state."
     )
+
+
+# --------------------------------------------------------------------------
+# /silence for Admins: "silence" or "silence the Generals too"
+#
+# The Generals' /silence is unchanged (see /silence above). An Admin -- anyone with Manage Server
+# (ADMIN_PERMISSION) -- is asked first, in a private message only they can see, how far to go.
+# Nothing changes until a button is pressed:
+#   green  "Silence"                -> what /silence has always done: @everyone's Speak is denied in
+#                                      the voice channel, and nothing else is touched.
+#   red    "Silence Generals too"   -> the same, and in addition the General role's own Speak setting
+#                                      in that channel is switched to Deny, so only Admins can talk.
+# /unsilence puts both back exactly as they were. What the General role's Speak setting was before is
+# saved in silence_state.json under "general", next to @everyone's saved setting, and only an Admin can
+# lift a silence that included the Generals.
+#
+# Replies are public: the Generals' /silence and /unsilence answer in the channel for everyone to see, and
+# so does an Admin's result once they have picked. Only the green / red choice itself is private. Anything
+# that did not simply work (nothing changed, only partly done, Discord refused) is shown to the Admin alone.
+#
+# The General role is only ever changed in the ONE voice channel being silenced, and only its Speak
+# setting there; every other setting on its overwrite is left as it is.
+# --------------------------------------------------------------------------
+
+_SILENCE_CHOICE_TIMEOUT = 60  # seconds the green / red buttons stay usable
+
+# What the Admin's private message says once the result has been posted in the channel.
+_SILENCE_POSTED_NOTE = "✅ Done -- the result is posted in the channel for everyone to see."
+
+
+def _silence_is_admin(interaction: discord.Interaction) -> bool:
+    """True if the person using the command or button has Manage Server (ADMIN_PERMISSION). Discord works
+    this out for each command or button press, so it is never an out-of-date copy."""
+    return bool(getattr(interaction.permissions, ADMIN_PERMISSION, False))
+
+
+def _silence_why(error: discord.HTTPException) -> str:
+    """Plain words for a permission change that Discord refused."""
+    if isinstance(error, discord.Forbidden):
+        return (
+            "I don't have permission to manage permissions in that channel. "
+            "I need the **Manage Roles** permission."
+        )
+    return "Discord returned an error while I was changing that channel's permissions."
+
+
+def _silence_choice_embed(
+    channel: discord.VoiceChannel, moderator: Any, already: bool, red_problem: Optional[str],
+) -> discord.Embed:
+    """The private choice shown to an Admin before /silence changes anything."""
+    name = discord.utils.escape_markdown(channel.name)
+    if already:
+        intro = (
+            f"**{name}** is already silenced, but the Generals can still speak. "
+            "Pick what to do -- nothing is changed until you do.\n\n"
+        )
+        green = "🟢 **Silence** -- changes nothing: it is already silenced for @everyone.\n"
+    else:
+        intro = f"Silencing **{name}**. Pick how far to go -- nothing is changed until you do.\n\n"
+        green = "🟢 **Silence** -- @everyone can't speak here. Generals still can.\n"
+    if red_problem:
+        red = f"🔴 **Silence Generals too** -- not available right now: {red_problem}\n\n"
+    else:
+        red = (
+            "🔴 **Silence Generals too** -- neither @everyone nor the Generals can speak here. "
+            "Only Admins can.\n\n"
+        )
+    return discord.Embed(
+        title="Silence this channel",
+        description=(
+            intro + green + red
+            + f"Only {discord.utils.escape_markdown(moderator.display_name)} can answer this, and it expires "
+            f"after {_SILENCE_CHOICE_TIMEOUT} seconds if nobody picks."
+        ),
+        colour=discord.Colour(0xE67E22),
+    )
+
+
+async def _silence_choice(
+    interaction: discord.Interaction, guild: discord.Guild, moderator: discord.Member,
+    channel: discord.VoiceChannel,
+) -> None:
+    """Shows an Admin the private green / red choice for `channel`. Nothing is changed here -- see
+    _silence_apply, run from inside _SilenceChoiceView once a button is pressed."""
+    record = await bot.store.get(channel.id)
+    if record is not None and record.get("general") is not None:
+        # Already silenced, Generals included: there is nothing left to choose.
+        await interaction.followup.send(f"\U0001F507 {channel.mention} is already silenced, Generals included.")
+        return
+    red_problem = None
+    if guild.get_role(GENERAL_ROLE_ID) is None:
+        red_problem = f"I couldn't find the General role (ID {GENERAL_ROLE_ID}) in this server."
+    view = _SilenceChoiceView(guild, moderator, channel, red_problem)
+    view.message = await interaction.followup.send(
+        embed=_silence_choice_embed(channel, moderator, record is not None, red_problem),
+        view=view, ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def _silence_apply(
+    guild: discord.Guild, channel_id: int, moderator: discord.Member, generals_too: bool,
+) -> Tuple[str, bool]:
+    """Does the work for a green (generals_too=False) or red (True) press and returns (text, public).
+
+    `public` is True only when the channel was silenced exactly as the Admin asked: that result is posted in
+    the channel for everyone to see, like the Generals' /silence reply. Every other result (nothing changed,
+    only partly done, Discord refused) is for the Admin alone, so `public` is False for those.
+
+    Everything is looked up again, because time has passed since the choice was shown. The @everyone part
+    is the same as the plain /silence. The General part only ever happens after that has worked, so if it
+    fails the channel is simply in an ordinary, already-understood state: silenced, with the Generals
+    still able to speak."""
+    channel = guild.get_channel(channel_id)
+    if not isinstance(channel, discord.VoiceChannel):
+        return "That voice channel doesn't exist any more, so I haven't changed anything.", False
+    me = guild.me
+    if me is None or not channel.permissions_for(me).manage_roles:
+        return (
+            "I don't have the **Manage Roles** permission in that channel, so I can't change its "
+            "permissions. I haven't changed anything.",
+            False,
+        )
+
+    # --- @everyone: exactly what the plain /silence does ------------------------------------------
+    everyone = guild.default_role
+    record = await bot.store.get(channel.id)
+    already = record is not None
+    if already:
+        # Already silenced: just make sure Speak is still denied (the saved "before" state is kept).
+        overwrite = channel.overwrites_for(everyone)
+        if overwrite.speak is not False:
+            overwrite.speak = False
+            try:
+                await channel.set_permissions(
+                    everyone, overwrite=overwrite, reason=f"Re-applied by /silence ({moderator})"
+                )
+            except discord.HTTPException as error:
+                return _silence_why(error), False
+    else:
+        had_overwrite = everyone in channel.overwrites
+        overwrite = channel.overwrites_for(everyone)
+        previous_speak = overwrite.speak  # True, False, or None -- saved as-is
+        overwrite.speak = False
+        try:
+            await channel.set_permissions(
+                everyone, overwrite=overwrite, reason=f"Silenced by {moderator} via /silence"
+            )
+        except discord.HTTPException as error:
+            return _silence_why(error), False
+        await bot.store.set(channel.id, previous_speak, had_overwrite)
+        record = await bot.store.get(channel.id)
+        log.info(
+            "Silenced #%s (%s) in guild %s -- requested by %s. previous_speak=%r had_overwrite=%r",
+            channel.name, channel.id, guild.name, moderator, previous_speak, had_overwrite,
+        )
+
+    if not generals_too:
+        if already:
+            return f"\U0001F507 {channel.mention} is already silenced.", False
+        return (
+            f"\U0001F507 Silenced **{channel.name}** -- Only Mclovin and Generals can speak. "
+            f"No one was server-muted, and existing per-role/per-member overrides "
+            f"(including any explicit Speak allow) are untouched.",
+            True,
+        )
+
+    # --- Red: the General role as well ------------------------------------------------------------
+    if record is not None and record.get("general") is not None:
+        # (two Admins at once)
+        return f"\U0001F507 {channel.mention} is already silenced, Generals included.", False
+    done = (
+        f"\U0001F507 {channel.mention} was already silenced."
+        if already else f"\U0001F507 Silenced **{channel.name}**."
+    )
+    general = guild.get_role(GENERAL_ROLE_ID)
+    if general is None:
+        return (
+            f"{done} But I couldn't find the General role (ID {GENERAL_ROLE_ID}), "
+            f"so the Generals can still speak.",
+            False,
+        )
+    had_general = general in channel.overwrites
+    general_overwrite = channel.overwrites_for(general)
+    previous_general = general_overwrite.speak  # True, False, or None -- saved as-is
+    # Saved BEFORE the change, so a crash in between can never leave the Generals silenced with no
+    # record of how to put them back.
+    if not await bot.store.set_general(channel.id, previous_general, had_general):
+        return f"{done} But it was unsilenced while I was working, so I left the Generals alone.", False
+    general_overwrite.speak = False
+    try:
+        await channel.set_permissions(
+            general, overwrite=general_overwrite, reason=f"Generals silenced by {moderator} via /silence"
+        )
+    except discord.HTTPException as error:
+        await bot.store.clear_general(channel.id)
+        return f"{done} But I couldn't silence the Generals, so they can still speak. {_silence_why(error)}", False
+    log.info(
+        "Silenced the Generals in #%s (%s) in guild %s -- requested by %s. previous_speak=%r had_overwrite=%r",
+        channel.name, channel.id, guild.name, moderator, previous_general, had_general,
+    )
+    return (
+        f"{done} The Generals are silenced too -- only Mclovin and Admins can speak. "
+        f"No one was server-muted. `/unsilence` (Admins only) puts everything back exactly as it was.",
+        True,
+    )
+
+
+async def _unsilence_generals(
+    guild: discord.Guild, channel: discord.VoiceChannel, moderator: discord.Member, saved: dict,
+) -> Optional[str]:
+    """Puts the General role's Speak setting in `channel` back to what `saved` says it was. Returns None
+    when that is done, or the text to show if Discord refused (in which case nothing was changed)."""
+    general = guild.get_role(GENERAL_ROLE_ID)
+    if general is not None:  # (if the role has been deleted, its setting went with it: nothing to put back)
+        overwrite = channel.overwrites_for(general)
+        overwrite.speak = saved.get("previous_speak")
+        try:
+            if overwrite.is_empty() and not saved.get("had_overwrite"):
+                # The General role had no overwrite here before /silence: remove it again instead of
+                # leaving an empty one behind.
+                await channel.set_permissions(
+                    general, overwrite=None, reason=f"Generals restored by {moderator} via /unsilence"
+                )
+            else:
+                await channel.set_permissions(
+                    general, overwrite=overwrite, reason=f"Generals restored by {moderator} via /unsilence"
+                )
+        except discord.HTTPException as error:
+            return (
+                f"I couldn't put the Generals' Speak setting back, so I haven't changed anything. "
+                f"{_silence_why(error)}"
+            )
+    await bot.store.clear_general(channel.id)
+    log.info(
+        "Restored the Generals' Speak setting in #%s (%s) in guild %s -- requested by %s. restored_speak=%r",
+        channel.name, channel.id, guild.name, moderator, saved.get("previous_speak"),
+    )
+    return None
+
+
+class _SilenceChoiceView(discord.ui.View):
+    """The green / red buttons shown to an Admin who uses /silence. The choice itself is private (ephemeral),
+    so only that Admin ever sees it, and nothing changes until one of the two buttons is pressed. When the
+    silence then works as asked, the result is posted in the channel for everyone to see."""
+
+    def __init__(
+        self, guild: discord.Guild, moderator: discord.Member, channel: discord.VoiceChannel,
+        red_problem: Optional[str],
+    ) -> None:
+        super().__init__(timeout=_SILENCE_CHOICE_TIMEOUT)
+        self.guild = guild
+        self.moderator = moderator
+        self.channel_id = channel.id
+        self.message: Optional[discord.Message] = None  # the choice itself; set once it has been sent
+        self._answered = False  # set by the first press of either button, so nothing can be processed twice
+        if red_problem:
+            self.silence_generals.disabled = True  # (the red button; the reason is written on the embed)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.moderator.id:
+            await interaction.response.send_message(
+                "Only the person who used /silence can use these buttons.", ephemeral=True,
+            )
+            return False
+        if not _silence_is_admin(interaction):
+            await interaction.response.send_message(
+                "You no longer have the **Manage Server** permission, so you can't answer this.", ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _first_answer(self, interaction: discord.Interaction) -> bool:
+        """True for the first press only. Any later press (a double click, or one button right
+        after the other) is ignored."""
+        if self._answered:
+            await interaction.response.defer()
+            return False
+        self._answered = True  # no await between the check and this line, so two presses can't both get through
+        self.stop()
+        return True
+
+    async def _go(self, interaction: discord.Interaction, generals_too: bool) -> None:
+        # Answer the press straight away (Discord only waits 3 seconds for that), then do the real work.
+        await interaction.response.edit_message(content="Silencing…", embed=None, view=None)
+        try:
+            text, public = await _silence_apply(self.guild, self.channel_id, self.moderator, generals_too)
+        except Exception:
+            log.exception("/silence: changing the channel's permissions failed unexpectedly")
+            text = "Something went wrong while I was changing that channel's permissions. Please check them in Discord."
+            public = False
+        if public:
+            # It worked exactly as asked, so say so in the channel for everyone to see (the Generals' /silence
+            # does the same), and leave only a short note on the private message. This is an ordinary message
+            # in the channel where the command was used, not a reply to the button press, so it doesn't matter
+            # that the choice message is private. If posting it fails, the Admin simply gets the full result on
+            # the private message instead. The mention names the Admin without pinging them.
+            try:
+                await interaction.channel.send(
+                    f"{text}\nSilenced by {self.moderator.mention}.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                text = _SILENCE_POSTED_NOTE
+            except Exception:
+                log.warning("/silence: could not post the result in the channel", exc_info=True)
+        try:
+            await interaction.edit_original_response(content=text)
+        except Exception:
+            log.warning("/silence: could not show the result on the choice message", exc_info=True)
+            try:
+                await interaction.followup.send(text, ephemeral=True)
+            except Exception:
+                log.warning("/silence: could not tell the Admin the result", exc_info=True)
+
+    @discord.ui.button(label="Silence", style=discord.ButtonStyle.success)
+    async def silence_everyone(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._first_answer(interaction):
+            return
+        await self._go(interaction, False)
+
+    @discord.ui.button(label="Silence Generals too", style=discord.ButtonStyle.danger)
+    async def silence_generals(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._first_answer(interaction):
+            return
+        await self._go(interaction, True)
+
+    async def on_timeout(self) -> None:
+        if self._answered:
+            return
+        self._answered = True
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="Nobody picked in time, so nothing was changed. Run /silence again when you're ready.",
+                    embed=None, view=None,
+                )
+            except Exception:
+                log.warning("/silence: could not update the choice message after it timed out", exc_info=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        log.error("Unhandled error in the /silence buttons", exc_info=error)
+        text = "Something went wrong with that button. Please check the channel's permissions in Discord before trying again."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except Exception:
+            log.warning("/silence: could not tell the Admin that a button failed", exc_info=True)
 
 
 # --------------------------------------------------------------------------
