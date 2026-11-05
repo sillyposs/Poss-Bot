@@ -54,6 +54,12 @@ Seven slash commands:
               mod-log channel. Only members with one of the staff roles in
               TKL_STAFF_ROLE_IDS can use it; that role list is the only
               authorisation check.
+              Afterwards the moderator also gets a second private message with a bold reminder to
+              set the member's nickname to EXACTLY their Xbox gamertag, and a green Add Gamertag
+              button: it opens a text box, and the bot sets the nickname to whatever is typed there
+              (see "/tkl: the Add Gamertag step" further down). The command itself is unchanged.
+              The mod-log entry has a Gamertag line: "Not set yet" until that button has been used,
+              and the name that was set afterwards (the bot edits the entry).
 
   /commands   Lists this bot's commands and what they do. Open to everyone.
 
@@ -2114,6 +2120,8 @@ async def commands_help(interaction: discord.Interaction):
         "`/ban` -- Bans a user, even if they have left (pick from the suggestions or enter their user ID).\n"
         "`/kick` -- Kicks a member (pick from the suggestions or enter their user ID).\n"
         "`/unverify` -- Takes away all of a member's roles and gives them the Unverified role (pick from the suggestions or enter their user ID; asks you first).\n"
+        "`/lock` -- Stops @everyone sending messages in a channel, forum or thread (leave the channel empty for the one you're in, or pick or enter another).\n"
+        "`/unlock` -- Undoes /lock, putting the permission back exactly as it was.\n"
         "`/define` -- Looks up a word or phrase in the Merriam-Webster dictionary and shows its definitions.\n"
         "`/urban` -- Posts an Urban Dictionary definition for a word or phrase (if it's available).\n"
         "`/sos` -- Calls for help in Cyrodiil PvP and pings the SOS role. Shared 30-minute cooldown "
@@ -2403,14 +2411,15 @@ async def _tkl_swap_roles(
     return None
 
 
-def _tkl_approval_embed(member: discord.Member, note: Optional[str]) -> discord.Embed:
+def _tkl_approval_embed(member: discord.Member, note: Optional[str], limited: bool = False) -> discord.Embed:
     # The member is pinged by the message CONTENT (see _tkl_verify); the mention in here is only text.
+    # A Limited Access member can only see the voice channels, so they are not sent to #role-select.
+    welcome = f"{member.mention}, welcome to The Kings Legion Discord!"
+    if not limited:
+        welcome += f" head over to <#{ROLE_SELECTION_CHANNEL_ID}> and choose all the roles that apply to you."
     embed = discord.Embed(
         title="Application approved",
-        description=(
-            f"{member.mention}, welcome to The Kings Legion Discord! head over to "
-            f"<#{ROLE_SELECTION_CHANNEL_ID}> and choose all the roles that apply to you."
-        ),
+        description=welcome,
         colour=discord.Colour(0x2ECC71),
     )
     if note:
@@ -2433,13 +2442,14 @@ def _tkl_audit_embed(
     )
     embed.add_field(name="Member", value=_who(member.display_name, member.id), inline=True)
     embed.add_field(name="Verified by", value=_who(moderator.display_name, moderator.id), inline=True)
-    embed.add_field(name="Access level", value=access_label, inline=True)
-    unverified_name, grant_name = discord.utils.escape_markdown(unverified.name), discord.utils.escape_markdown(grant_role.name)
-    embed.add_field(
-        name="Roles",
-        value=f"Removed: {unverified_name}\n" + (f"Already had: {grant_name}" if had_role else f"Added: {grant_name}"),
-        inline=False,
-    )
+    # Limited Access gets a ❗ in front of it so that it stands out in the mod-log.
+    level = f"❗ {access_label}" if grant_role.id == LIMITED_ACCESS_ROLE_ID else access_label
+    embed.add_field(name="Access level", value=level, inline=True)
+    # The roles are no longer listed here (Discord's own Audit Log has them), so unverified and had_role are
+    # not used any more; they stay in the signature so that nothing that calls this has to change.
+    # The last line is the member's gamertag. It says so while the nickname has not been set, and the Add Gamertag
+    # step edits this entry once it has been (see "/tkl: the Add Gamertag step").
+    embed.add_field(name="Gamertag", value=_tkl_audit_gamertag(None), inline=False)
     if note:
         embed.add_field(name="Note from moderator:", value=note, inline=False)
     embed.timestamp = _utcnow()
@@ -2480,16 +2490,16 @@ async def _tkl_finish(
     work -- the role changes and two message sends below can occasionally take longer than that.
     """
     name = discord.utils.escape_markdown(member.display_name)
-    message = interaction.message  # the access-choice message; editable long after the 3-second window
     await interaction.response.edit_message(content=f"Verifying **{name}**…", embed=None, view=None)
 
     async def finish(text: str) -> None:
-        if message is not None:
-            try:
-                await message.edit(content=text)
-                return
-            except Exception:
-                log.warning("/tkl: could not update the access-choice message with the result", exc_info=True)
+        # The access-choice message is private (ephemeral). Discord only lets a private message be changed
+        # through the button press itself (as /silence does), not with message.edit(), which it refuses.
+        try:
+            await interaction.edit_original_response(content=text, allowed_mentions=discord.AllowedMentions.none())
+            return
+        except Exception:
+            log.warning("/tkl: could not update the access-choice message with the result", exc_info=True)
         # The message is gone, or couldn't be edited: a fresh ephemeral reply still gets the result
         # to the moderator.
         await _tkl_reply(interaction, text)
@@ -2514,7 +2524,7 @@ async def _tkl_finish(
     try:
         approval = await channel.send(
             content=member.mention,
-            embed=_tkl_approval_embed(member, shown_note),
+            embed=_tkl_approval_embed(member, shown_note, limited=grant_role.id == LIMITED_ACCESS_ROLE_ID),
             allowed_mentions=discord.AllowedMentions(everyone=False, users=[member], roles=False, replied_user=False),
         )
     except Exception:
@@ -2529,11 +2539,11 @@ async def _tkl_finish(
         except Exception:
             log.warning("/tkl: could not add the check-mark reaction to the approval message", exc_info=True)
 
+    audit_embed: Optional[discord.Embed] = None
+    audit_entry: Optional[discord.Message] = None  # the posted entry, kept so the Add Gamertag step can update it
     try:
-        await audit_channel.send(
-            embed=_tkl_audit_embed(member, moderator, unverified, grant_role, access_label, had_role, shown_note),
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        audit_embed = _tkl_audit_embed(member, moderator, unverified, grant_role, access_label, had_role, shown_note)
+        audit_entry = await audit_channel.send(embed=audit_embed, allowed_mentions=discord.AllowedMentions.none())
     except Exception:
         log.exception("/tkl: could not post the audit entry for %s (%s)", member, member.id)
         warnings.append(
@@ -2548,6 +2558,8 @@ async def _tkl_finish(
     else:
         done = f"✅ Verified **{name}** with **{access_label}**: removed {unverified_name} and added {grant_name}."
     await finish("\n".join([done] + warnings))
+    # The member is verified. Remind the moderator about their nickname (see "/tkl: the Add Gamertag step").
+    await _tkl_offer_gamertag(interaction, guild, moderator, member, audit_entry, audit_embed)
 
 
 class _TklAccessView(discord.ui.View):
@@ -2653,6 +2665,277 @@ class _TklAccessView(discord.ui.View):
                 await interaction.response.send_message(text, ephemeral=True)
         except Exception:
             log.warning("/tkl: could not tell the moderator that a button failed", exc_info=True)
+
+
+# --------------------------------------------------------------------------
+# /tkl: the "Add Gamertag" step
+#
+# A verified member's server nickname is supposed to be EXACTLY their Xbox gamertag. So that the moderator
+# can't forget, a successful /tkl ends with a second private message under the usual "Verified ..." result:
+# a bold reminder and a green "Add Gamertag" button. The button opens a small text box, and whatever is typed
+# in becomes the member's nickname in this server, set by the bot (so it is exactly what was typed).
+# The mod-log entry that /tkl posted has a Gamertag line for this: "Not set yet" at first, and once a nickname
+# has been set here the bot edits that entry to show it (again if the moderator changes it).
+#
+# This only runs after the verification itself has succeeded, and nothing in it can undo that: if the
+# reminder can't be sent, or the nickname can't be set, the moderator is told and the member stays verified.
+# The command itself (/tkl @member) is exactly as it was.
+# --------------------------------------------------------------------------
+
+_TKL_GAMERTAG_TIMEOUT = 600  # seconds the Add Gamertag button stays usable
+_TKL_NICKNAME_MAX = 32  # the longest nickname Discord accepts
+
+
+def _tkl_shown(text: str) -> str:
+    """Text typed by a moderator, made safe to show inside a message (no formatting, no mentions)."""
+    return discord.utils.escape_mentions(discord.utils.escape_markdown(text))
+
+
+def _tkl_gamertag_note(name: str, can_set: bool) -> discord.Embed:
+    """The orange "last step" card shown under the moderator's private result. `name` is the member's name,
+    already made safe to show."""
+    if can_set:
+        how = "Press **Add Gamertag**, type it in, and I’ll set the nickname for you."
+    else:
+        how = "I can’t change nicknames myself (I need the **Manage Nicknames** permission), so please set it by hand."
+    embed = discord.Embed(
+        title="Last step: their gamertag",
+        description=f"**Please ensure {name}’s nickname is set EXACTLY to their Xbox gamertag.**\n\n{how}",
+        colour=discord.Colour(0xE67E22),
+    )
+    if can_set:
+        embed.set_footer(text=f"The button stops working after {_TKL_GAMERTAG_TIMEOUT // 60} minutes.")
+    return embed
+
+
+def _tkl_gamertag_done(nickname: str) -> discord.Embed:
+    """What the card turns into once the nickname has been set."""
+    return discord.Embed(
+        title="Gamertag set",
+        description=(
+            f"Their nickname is now **{_tkl_shown(nickname)}**.\n\n"
+            "Made a typo? Press **Change Gamertag** to fix it."
+        ),
+        colour=discord.Colour(0x2ECC71),
+    )
+
+
+def _tkl_gamertag_expired(name: str) -> discord.Embed:
+    """What the card turns into if nobody used the button in time."""
+    return discord.Embed(
+        title="Add Gamertag has expired",
+        description=(
+            f"**Please ensure {name}’s nickname is set EXACTLY to their Xbox gamertag.**\n\n"
+            "The button has expired, so please set it by hand."
+        ),
+        colour=discord.Colour(0xE67E22),
+    )
+
+
+async def _tkl_set_nickname(member: discord.Member, nickname: str, moderator: discord.Member) -> Optional[str]:
+    """Sets the member's nickname in this server. Returns None if that worked; otherwise the private message
+    for the moderator explaining why not."""
+    name = discord.utils.escape_markdown(member.display_name)
+    reason = f"Gamertag set by {moderator.display_name} ({moderator.id}) via /tkl"[:512]  # 512: Discord's audit-log limit
+    try:
+        await member.edit(nick=nickname, reason=reason)
+    except Exception as exc:
+        if _tkl_member_gone(exc):
+            log.warning("/tkl: %s (%s) left the server before their gamertag could be set", member, member.id)
+            return f"**{name}** is no longer in the server, so nothing was changed."
+        log.exception("/tkl: could not set the nickname of %s (%s) to %r", member, member.id, nickname)
+        if isinstance(exc, discord.Forbidden):
+            return (
+                "Discord wouldn’t let me change their nickname (I need the **Manage Nicknames** permission, and "
+                "my role has to be above theirs). Nothing was changed."
+            )
+        if isinstance(exc, discord.HTTPException):
+            if _tkl_failed_cleanly(exc):
+                return (
+                    f"Discord refused that nickname (error {exc.status}), so nothing was changed. "
+                    "Please check it and press the button to try again."
+                )
+            return f"Discord had a problem (error {exc.status}), so I’m not sure their nickname changed. Press the button to try again."
+        return (
+            "An unexpected error happened, so I’m not sure their nickname changed (details are in the bot's logs). "
+            "Press the button to try again."
+        )
+    log.info("/tkl: the nickname of %s (%s) was set to %r by %s (%s)", member, member.id, nickname, moderator, moderator.id)
+    return None
+
+
+def _tkl_audit_gamertag(nickname: Optional[str]) -> str:
+    """The text of the "Gamertag" line in the mod-log entry: a warning until the nickname has been set with the
+    Add Gamertag button, then the name that was set."""
+    if nickname is None:
+        return "⚠️ Not set yet"
+    return f"✅ Set to **{_tkl_shown(nickname)}**"
+
+
+async def _tkl_update_mod_log(entry: Optional[discord.Message], embed: Optional[discord.Embed], nickname: str) -> None:
+    """Changes the "Gamertag" line of the mod-log entry that /tkl posted so that it shows the nickname that was just
+    set. Never raises: the nickname is already set, so a problem here (the entry was deleted, say) is only logged."""
+    if entry is None or embed is None:
+        return  # the entry was never posted (the moderator was told so at the time)
+    try:
+        for index, field in enumerate(embed.fields):
+            if field.name == "Gamertag":
+                embed.set_field_at(index, name="Gamertag", value=_tkl_audit_gamertag(nickname), inline=False)
+                break
+        else:
+            raise LookupError("the mod-log entry has no Gamertag line")
+        await entry.edit(embed=embed)
+    except Exception:
+        log.warning("/tkl: could not update the Gamertag line in the mod-log entry", exc_info=True)
+
+
+class _TklGamertagView(discord.ui.View):
+    """The green Add Gamertag button under the moderator's private result. Only the moderator who ran /tkl can
+    use it. It opens a text box (_TklGamertagModal); nothing changes until a gamertag is typed in and sent."""
+
+    def __init__(
+        self, moderator: discord.Member, member: discord.Member,
+        audit_entry: Optional[discord.Message] = None, audit_embed: Optional[discord.Embed] = None,
+    ) -> None:
+        super().__init__(timeout=_TKL_GAMERTAG_TIMEOUT)
+        self.moderator = moderator
+        self.member = member
+        self.audit_entry = audit_entry  # the mod-log entry for this verification (None if it could not be posted)
+        self.audit_embed = audit_embed  # what that entry shows, so that its Gamertag line can be changed
+        self.name = discord.utils.escape_markdown(member.display_name)  # as shown on the card
+        self.message: Optional[discord.Message] = None  # the card itself; set once it has been sent
+        self.nickname: Optional[str] = None  # what the nickname was set to through this button, once it has been
+        self.busy = False  # True while a nickname is being set, so two answers can't overlap
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.moderator.id:
+            await interaction.response.send_message(
+                "Only the moderator who ran /tkl for this member can use this button.", ephemeral=True,
+            )
+            return False
+        if not _is_tkl_staff(interaction.user):
+            await interaction.response.send_message(
+                "You no longer have a staff role, so you can’t use this.", ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Add Gamertag", style=discord.ButtonStyle.success)
+    async def add_gamertag(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(_TklGamertagModal(self))
+
+    async def on_timeout(self) -> None:
+        if self.message is None:
+            return
+        try:
+            if self.nickname is None:
+                await self.message.edit(embed=_tkl_gamertag_expired(self.name), view=None)
+            else:
+                await self.message.edit(view=None)  # it was set: the card stays as it is, without the Change Gamertag button
+        except Exception:
+            log.warning("/tkl: could not update the Add Gamertag message after it expired", exc_info=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        log.error("Unhandled error in the /tkl Add Gamertag button", exc_info=error)
+        text = "Something went wrong with that button. Please check their nickname in Discord."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except Exception:
+            log.warning("/tkl: could not tell the moderator that the Add Gamertag button failed", exc_info=True)
+
+
+class _TklGamertagModal(discord.ui.Modal):
+    """The text box that opens when Add Gamertag (or Change Gamertag) is pressed."""
+
+    def __init__(self, owner: "_TklGamertagView") -> None:
+        super().__init__(title=f"Gamertag for {owner.member.display_name}"[:45], timeout=_TKL_GAMERTAG_TIMEOUT)
+        self.owner = owner
+        self.gamertag = discord.ui.TextInput(
+            label="Their exact Xbox gamertag",
+            placeholder="Same spelling, spaces and capital letters as on Xbox",
+            default=owner.nickname,  # empty the first time; what was typed last when changing it
+            min_length=1,
+            max_length=_TKL_NICKNAME_MAX,
+            required=True,
+        )
+        self.add_item(self.gamertag)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        owner = self.owner
+        nickname = (self.gamertag.value or "").strip()
+        if not nickname:
+            await interaction.response.send_message(
+                "That was empty, so nothing was changed. Press the button and try again.", ephemeral=True,
+            )
+            return
+        if owner.busy:  # an earlier answer is still being applied
+            await interaction.response.defer()
+            return
+        owner.busy = True
+        try:
+            await interaction.response.defer()  # answered at once (Discord only waits 3 seconds); the change below can take longer
+            problem = await _tkl_set_nickname(owner.member, nickname, owner.moderator)
+            if problem is not None:
+                await interaction.followup.send(
+                    problem, ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            owner.nickname = nickname
+            owner.add_gamertag.label = "Change Gamertag"
+            owner.add_gamertag.style = discord.ButtonStyle.secondary
+            try:
+                await interaction.edit_original_response(embed=_tkl_gamertag_done(nickname), view=owner)
+            except Exception:
+                log.warning("/tkl: could not update the Add Gamertag message", exc_info=True)
+                try:
+                    await interaction.followup.send(
+                        f"✅ Their nickname is now **{_tkl_shown(nickname)}**.",
+                        ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except Exception:
+                    log.warning("/tkl: could not tell the moderator that the nickname was set", exc_info=True)
+            # The mod-log entry said "Not set yet" (or showed an earlier name): make it show this one.
+            await _tkl_update_mod_log(owner.audit_entry, owner.audit_embed, nickname)
+        finally:
+            owner.busy = False
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.error("Unhandled error in the /tkl gamertag box", exc_info=error)
+        text = "Something went wrong with that. Please check their nickname in Discord before trying again."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except Exception:
+            log.warning("/tkl: could not tell the moderator that the gamertag box failed", exc_info=True)
+
+
+async def _tkl_offer_gamertag(
+    interaction: discord.Interaction, guild: discord.Guild, moderator: discord.Member, member: discord.Member,
+    audit_entry: Optional[discord.Message] = None, audit_embed: Optional[discord.Embed] = None,
+) -> None:
+    """Run at the very end of a successful /tkl: sends the moderator the private reminder to set the new
+    member's nickname to their Xbox gamertag, with the green Add Gamertag button when the bot is able to change
+    nicknames. Never raises: a problem here is logged and must not disturb the verification, which is done."""
+    try:
+        me = guild.me
+        can_set = me is not None and bool(me.guild_permissions.manage_nicknames)
+        note = _tkl_gamertag_note(discord.utils.escape_markdown(member.display_name), can_set)
+        if can_set:
+            view = _TklGamertagView(moderator, member, audit_entry, audit_embed)
+            view.message = await interaction.followup.send(
+                embed=note, view=view, ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await interaction.followup.send(
+                embed=note, ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+            )
+    except Exception:
+        log.warning("/tkl: could not send the Add Gamertag reminder for %s (%s)", member, member.id, exc_info=True)
 
 
 async def _tkl_verify(
@@ -8454,6 +8737,599 @@ async def eso_patch_notes_ready():
                 _epn_task = asyncio.create_task(_EpnWatcher(bot, _EPN_INTERVAL, _EPN_STATE_FILE).run(), name="eso-patch-notes")
     except Exception:
         log.exception("The Patch Notes watcher could not be started")
+
+
+# --------------------------------------------------------------------------
+# /lock and /unlock
+#
+# /lock stops @everyone from sending messages in a channel, and /unlock puts it back exactly as it was.
+# Both work the same three ways:
+#
+#   /lock                          locks the channel you typed it in
+#   /lock channel:<its ID>         locks that channel instead (the channel you typed it in stays open)
+#   /lock channel:#channel-name    the same, by name (the box also suggests channels as you type)
+#
+# Both also take an optional reason, which is shown in the channel, in the mod-log and in Discord's own
+# Audit Log. Like /ban, the channel is a text box with suggestions, not Discord's channel picker, so a channel's
+# ID can be pasted into it. The answer is a plain public message in the channel the command was used in (which
+# is not always the channel that was locked). Anything that stops the command is shown to the moderator alone,
+# and nothing is changed.
+#
+# What "locked" means depends on what is being locked:
+#   - a text channel (announcement channels too): @everyone's Send Messages is switched to Deny;
+#   - a forum: @everyone's Send Messages (which is "create posts") and Send Messages in Posts ("reply") are both
+#     switched to Deny, so nobody new can post or reply;
+#   - a thread, or a forum post (which is a thread): Discord's own "locked" switch, because a thread has no
+#     permission settings of its own. Only people with Manage Threads can still write in a locked thread.
+#
+# For a channel or forum, what each permission was before (Allow, Deny or not set) is saved in lock_state.json,
+# and /unlock puts exactly that back. Only those permissions of @everyone's overwrite are touched: every other
+# setting on it, and every other role's or member's overwrite, is left alone. If @everyone had no overwrite in
+# the channel before, /unlock removes the one /lock had to create. A thread has nothing to save: it is simply
+# locked or not.
+#
+# /unlock only undoes a /lock. A channel that was set to "can't send messages" some other way (a read-only rules
+# channel, say) is refused rather than opened up, because nobody knows what it was before.
+#
+# Replacing a whole overwrite is what discord.py's set_permissions(role, send_messages=False) does: it would also
+# wipe any other setting on the overwrite. So, like /silence, the code takes the channel's current overwrite,
+# changes only the permissions named above, and sends that back.
+# --------------------------------------------------------------------------
+
+# Where the "undo" data for /unlock is kept. Same /data fallback as the other state files, so it survives restarts
+# and redeploys on FadeHost. Set the LOCK_STATE_PATH environment variable to put it somewhere else.
+LOCK_STATE_FILE = Path(
+    os.environ.get("LOCK_STATE_PATH")
+    or (Path("/data/lock_state.json") if Path("/data").is_dir() else Path(__file__).parent / "lock_state.json")
+)
+
+# The @everyone permissions /lock switches to Deny, for each kind of channel that has permission settings.
+_LOCK_PERMISSIONS = {
+    "text": ("send_messages",),
+    "forum": ("send_messages", "send_messages_in_threads"),
+}
+_LOCK_ALL_PERMISSIONS = frozenset(name for names in _LOCK_PERMISSIONS.values() for name in names)
+
+
+class LockStore:
+    """Loads and saves lock_state.json: for each text channel or forum that /lock has locked, what @everyone's
+    permissions were beforehand, so /unlock can put them back. Knows nothing about Discord.
+
+    A record looks like {"previous": {"send_messages": null}, "had_overwrite": false, "locked_by": 123, "locked_at": "..."}.
+    Each permission is true (Allow), false (Deny) or null (not set). had_overwrite says whether @everyone had any
+    overwrite in the channel at all, so /unlock can remove one that /lock had to create.
+    """
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._lock: Optional[asyncio.Lock] = None  # created on first use, inside the running event loop
+        self._unsafe = False  # True if an unreadable file could not be moved aside
+        self.records: Dict[str, dict] = self._load()  # channel id (str) -> record
+
+    def _guard(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    def _set_aside(self, label: str) -> Optional[Path]:
+        """Keep the broken file under another name so nothing recoverable is lost."""
+        stamp = _utcnow().strftime("%Y%m%dT%H%M%SZ")
+        target = self._path.with_name(f"{self._path.name}.{label}-{stamp}")
+        try:
+            os.replace(self._path, target)
+            return target
+        except OSError:
+            log.exception("Could not set aside %s", self._path)
+            return None
+
+    @staticmethod
+    def _valid(key: Any, value: Any) -> bool:
+        if not (isinstance(key, str) and key.isdigit() and isinstance(value, dict)):
+            return False
+        previous = value.get("previous")
+        if not isinstance(previous, dict) or not previous:
+            return False
+        for name, setting in previous.items():
+            if name not in _LOCK_ALL_PERMISSIONS or not (setting is None or isinstance(setting, bool)):
+                return False
+        return isinstance(value.get("had_overwrite"), bool)
+
+    def _load(self) -> Dict[str, dict]:
+        try:
+            text = self._path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}  # first run: nothing is locked
+        except OSError as exc:
+            log.error("/lock state file %s is unreadable (%s); /lock can't save anything until it is fixed.", self._path, exc)
+            self._unsafe = True  # refuse to write, so the damaged file can't be overwritten
+            return {}
+        try:
+            raw = json.loads(text)["locks"]
+            if not isinstance(raw, dict):
+                raise ValueError("'locks' is not an object")
+        except (ValueError, KeyError, TypeError) as exc:
+            saved = self._set_aside("corrupt")
+            log.error(
+                "/lock state file %s is malformed (%s)%s. Starting with nothing saved.",
+                self._path, exc, f"; it was kept as {saved.name}" if saved else "",
+            )
+            return {}
+        cleaned = {key: value for key, value in raw.items() if self._valid(key, value)}
+        if len(cleaned) != len(raw):
+            log.warning("/lock: skipped %d invalid record(s) in %s", len(raw) - len(cleaned), self._path)
+        return cleaned
+
+    def get(self, channel_id: int) -> Optional[dict]:
+        return self.records.get(str(channel_id))
+
+    def _write(self, records: Dict[str, dict]) -> None:
+        """Save `records` all-or-nothing, then start using them. Raises OSError if that fails (and nothing changes)."""
+        if self._unsafe:
+            raise OSError("the /lock state file is unreadable and was not moved aside, so I won't overwrite it")
+        text = json.dumps({"version": 1, "locks": records}, indent=2, sort_keys=True)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self._path.with_name(self._path.name + ".tmp")
+        with open(temp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, self._path)  # all-or-nothing swap
+        self.records = records
+
+    async def set(self, channel_id: int, record: dict) -> None:
+        """Remember `record` for the channel. Raises OSError if it can't be saved, and then nothing is remembered."""
+        async with self._guard():
+            self._write({**self.records, str(channel_id): record})
+
+    async def clear(self, channel_id: int) -> None:
+        """Forget the channel. Raises OSError if that can't be saved."""
+        async with self._guard():
+            if str(channel_id) in self.records:
+                self._write({key: value for key, value in self.records.items() if key != str(channel_id)})
+
+
+_lock_store = LockStore(LOCK_STATE_FILE)
+_lock_busy: Set[int] = set()  # channels being locked or unlocked right now, so two moderators can't clash
+
+
+def _lock_kind(target: Any) -> Optional[str]:
+    """"text", "forum" or "thread" for something /lock can lock; None for anything else."""
+    if isinstance(target, discord.TextChannel):
+        return "text"
+    if isinstance(target, discord.ForumChannel):
+        return "forum"
+    if isinstance(target, discord.Thread):
+        return "thread"
+    return None
+
+
+def _lock_noun(target: Any) -> str:
+    """What to call it in a message: channel, forum, post (a thread inside a forum) or thread."""
+    if isinstance(target, discord.ForumChannel):
+        return "forum"
+    if isinstance(target, discord.Thread):
+        return "post" if isinstance(target.parent, discord.ForumChannel) else "thread"
+    return "channel"
+
+
+def _lock_unsupported(target: Any) -> str:
+    if isinstance(target, (discord.VoiceChannel, discord.StageChannel)):
+        return "That’s a voice channel. `/lock` is for text channels, forums and threads. To stop people talking in a voice channel, use `/silence`."
+    return "I can only lock text channels, forums and threads."
+
+
+def _parse_channel_id(text: str) -> Optional[int]:
+    """The Discord channel ID in what was typed: the bare number (with or without a # in front), or a pasted channel link
+    like <#123...>. None if it isn't one."""
+    text = text.strip()
+    if text.startswith("<#") and text.endswith(">"):
+        text = text[2:-1]
+    elif text.startswith("#"):
+        text = text[1:]
+    if not (text.isascii() and text.isdigit() and 17 <= len(text) <= 19):
+        return None
+    value = int(text)
+    return value if value < 2 ** 63 else None
+
+
+def _lock_candidates(guild: discord.Guild) -> List[Any]:
+    """Everything /lock can lock that the bot knows about right now: text channels, forums and open threads."""
+    return [*guild.text_channels, *guild.forums, *guild.threads]
+
+
+def _lock_find(guild: discord.Guild, typed: str) -> Tuple[Any, str]:
+    """The channel, forum or thread that was typed (its ID, a pasted <#link>, or its exact name), or (None, why not)."""
+    text = typed.strip()
+    channel_id = _parse_channel_id(text)
+    if channel_id is not None:
+        found = guild.get_channel_or_thread(channel_id)
+        if found is None:
+            return None, (
+                "I can’t find a channel, forum or thread with that ID in this server. A thread that has been "
+                "closed can’t be found by its ID: use the command inside the thread instead."
+            )
+        return found, ""
+    wanted = (text[1:] if text.startswith("#") else text).strip().lower()
+    shown = _tkl_shown(text[:60])
+    if not wanted:
+        return None, "Pick a channel from the suggestions as you type, or enter its ID."
+    names = (wanted, wanted.replace(" ", "-"))
+    matches = [item for item in _lock_candidates(guild) if item.name.lower() in names]
+    if not matches:
+        return None, (
+            f"I can’t find a text channel, forum or thread called **{shown}**. Pick one from the suggestions as "
+            "you type, or enter its ID."
+        )
+    if len(matches) > 1:
+        return None, (
+            f"More than one channel is called **{shown}**. Pick the right one from the suggestions as you type, "
+            "or enter its ID."
+        )
+    return matches[0], ""
+
+
+def _lock_problem(guild: discord.Guild, moderator: Any, target: Any, kind: str) -> str:
+    """Why this moderator or the bot can't lock or unlock `target`, or "" if there is nothing in the way."""
+    me = guild.me
+    try:
+        theirs = target.permissions_for(moderator)
+        mine = target.permissions_for(me) if me is not None else None
+    except Exception:  # for example a thread whose channel the bot can't see
+        log.exception("/lock: could not work out the permissions in %s", getattr(target, "id", "?"))
+        return "I couldn’t check the permissions in that channel, so I haven’t changed anything."
+    if not theirs.manage_channels:
+        return "You need the **Manage Channels** permission in that channel."
+    if mine is None:
+        return "I couldn’t check my own permissions in that channel, so I haven’t changed anything."
+    if kind == "thread":
+        if not mine.manage_threads:
+            return "I don’t have the **Manage Threads** permission in that channel, so I can’t lock or unlock a thread there."
+    elif not mine.manage_roles:
+        return "I don’t have the **Manage Roles** permission in that channel, so I can’t change its permissions."
+    return ""
+
+
+def _lock_failure_text(locking: bool, where: str, kind: str, exc: BaseException) -> str:
+    """The message for a /lock or /unlock that Discord didn’t carry out (no technical details)."""
+    verb = "lock" if locking else "unlock"
+    if isinstance(exc, discord.Forbidden):
+        if kind == "thread":
+            return f"Discord wouldn’t let me {verb} {where}. I need the **Manage Threads** permission there. Nothing was changed."
+        # Discord only lets a bot change a permission that it has itself in that channel (unless it is an Administrator).
+        own = "**Send Messages** and **Send Messages in Posts**" if kind == "forum" else "**Send Messages**"
+        return (
+            f"Discord wouldn’t let me {verb} {where}. I need the **Manage Roles** permission there, and Discord only "
+            f"lets me change a permission that I have myself in that channel (here, {own}). Nothing was changed."
+        )
+    if isinstance(exc, discord.NotFound):
+        return f"{where} no longer exists, so nothing was changed."
+    if isinstance(exc, discord.HTTPException) and getattr(exc, "code", 0) == 50083:
+        return f"{where} is archived (closed), and Discord won’t let me change it until it’s reopened. Please reopen it and try again."
+    if _tkl_failed_cleanly(exc):
+        return f"I couldn’t {verb} {where}: Discord returned an error ({getattr(exc, 'status', '?')}). Nothing was changed."
+    # A timeout or server error: it may or may not have gone through, so nothing is announced or logged.
+    return (
+        f"I couldn’t confirm whether {where} was {verb}ed, because Discord didn’t answer properly. Please check its "
+        "settings before trying again. I haven’t announced or logged anything."
+    )
+
+
+def _lock_public_text(locking: bool, here: bool, target: Any, noun: str, reason: Optional[str]) -> str:
+    """The plain message everyone sees in the channel the command was used in."""
+    what = f"This {noun}" if here else target.mention
+    text = f"{'🔒' if locking else '🔓'} {what} has been {'locked' if locking else 'unlocked'}."
+    if reason:
+        text += f"\n**Reason:** {discord.utils.escape_mentions(reason)}"
+    return text
+
+
+def _lock_audit_embed(
+    locking: bool, target: Any, noun: str, moderator: Any, used_in: Any, reason: Optional[str],
+) -> discord.Embed:
+    # Names are plain text and the channel is a link, never a ping: this embed can't mention anyone.
+    word = "locked" if locking else "unlocked"
+    moderator_name = discord.utils.escape_mentions(moderator.display_name)
+    embed = discord.Embed(
+        title=f"{'🔒' if locking else '🔓'} {noun.capitalize()} {word}",
+        description=f"{target.mention} was {word} by **{discord.utils.escape_markdown(moderator_name)}**.",
+        colour=discord.Colour(0xE67E22 if locking else 0x2ECC71),
+    )
+    embed.add_field(name=noun.capitalize(), value=f"{target.mention} (`{target.id}`)", inline=True)
+    embed.add_field(name="Moderator", value=_who(moderator_name, moderator.id), inline=True)
+    if used_in is not None and used_in.id != target.id:  # the command was typed somewhere else
+        embed.add_field(name="Used in", value=f"<#{used_in.id}>", inline=True)
+    embed.add_field(
+        name="Reason", value=discord.utils.escape_mentions(reason) if reason else "No reason provided", inline=False,
+    )
+    embed.timestamp = _utcnow()
+    return embed
+
+
+async def _lock_do(
+    interaction: discord.Interaction, guild: discord.Guild, moderator: Any, target: Any, kind: str, locking: bool,
+    reason: Optional[str],
+) -> None:
+    """Looks at how `target` is right now and, if there is something to do, does it. Answers the interaction exactly
+    once: privately if nothing is going to be changed, otherwise publicly once it has been."""
+    none = discord.AllowedMentions.none()
+    command = "lock" if locking else "unlock"
+    word = "locked" if locking else "unlocked"
+    noun = _lock_noun(target)
+
+    async def refuse(text: str) -> None:
+        await interaction.response.send_message(text, ephemeral=True, allowed_mentions=none)
+
+    everyone = guild.default_role
+    record: Optional[dict] = None
+    overwrite: Optional[discord.PermissionOverwrite] = None
+    if kind == "thread":
+        is_locked = bool(target.locked)
+    else:
+        record = _lock_store.get(target.id)
+        overwrite = target.overwrites_for(everyone)
+        is_locked = all(getattr(overwrite, name) is False for name in _LOCK_PERMISSIONS[kind])
+
+    # --- Is there anything to do? ---
+    if locking:
+        if is_locked:
+            if kind != "thread" and record is None:
+                await refuse(
+                    f"{target.mention} already doesn’t let everyone send messages, so there’s nothing for me to lock. "
+                    "I haven’t changed anything."
+                )
+            else:
+                await refuse(f"🔒 {target.mention} is already locked.")
+            return
+    elif kind == "thread":
+        if not is_locked:
+            await refuse(f"{target.mention} isn’t locked.")
+            return
+    elif record is None:
+        if is_locked:
+            await refuse(
+                f"I didn’t lock {target.mention} with `/lock`, so I don’t know what its permissions were before, "
+                "and I’ve left it alone. If you want to open it up, change it in the channel’s settings."
+            )
+        else:
+            await refuse(f"{target.mention} isn’t locked.")
+        return
+    elif not any(getattr(overwrite, name) != setting for name, setting in record["previous"].items()):
+        # Someone has already put it back by hand, so there is nothing to restore. Forget what was saved.
+        try:
+            await _lock_store.clear(target.id)
+        except OSError:
+            log.exception("/unlock: could not forget the saved settings of %s", target.id)
+        await refuse(f"{target.mention} isn’t locked any more (someone has already changed it back), so I haven’t changed anything.")
+        return
+
+    # --- Get everything ready. Nothing has been changed yet. ---
+    created = False
+    if kind != "thread":
+        if locking:
+            permissions = _LOCK_PERMISSIONS[kind]
+            if record is None:
+                # Saved BEFORE the change, so a crash can never leave a locked channel nobody can restore.
+                record = {
+                    "previous": {name: getattr(overwrite, name) for name in permissions},
+                    "had_overwrite": everyone in target.overwrites,
+                    "locked_by": moderator.id,
+                    "locked_at": _iso(_utcnow()),
+                }
+                try:
+                    await _lock_store.set(target.id, record)
+                except OSError:
+                    log.exception("/lock: could not save the settings of %s", target.id)
+                    await refuse(
+                        "I couldn’t save how that channel’s permissions are set right now, so I haven’t locked it. "
+                        "Nothing was changed. Please tell an admin; the details are in the bot’s logs."
+                    )
+                    return
+                created = True
+            # (A record that already exists, with the channel only partly locked, keeps its original "previous".)
+            for name in permissions:
+                setattr(overwrite, name, False)
+        else:
+            for name, setting in record["previous"].items():
+                setattr(overwrite, name, setting)
+
+    audit_reason = (
+        f"{word.capitalize()} by {moderator.display_name} ({moderator.id}) via /{command}: "
+        f"{reason or 'No reason provided'}"
+    )[:512]
+
+    # --- The change. From here on the answer is public, in the channel the command was used in. ---
+    await interaction.response.defer()
+    try:
+        if kind == "thread":
+            await target.edit(locked=locking, reason=audit_reason)
+        elif not locking and overwrite.is_empty() and not record["had_overwrite"]:
+            # @everyone had no overwrite here before /lock, and nothing is left to set: remove the entry instead
+            # of leaving an empty one behind.
+            await target.set_permissions(everyone, overwrite=None, reason=audit_reason)
+        else:
+            await target.set_permissions(everyone, overwrite=overwrite, reason=audit_reason)
+    except Exception as exc:
+        log.exception("/%s: could not %s %s (%s)", command, command, getattr(target, "name", "?"), target.id)
+        if created and _tkl_failed_cleanly(exc):  # Discord definitely refused, so there is nothing to restore
+            try:
+                await _lock_store.clear(target.id)
+            except OSError:
+                log.exception("/lock: could not forget the saved settings of %s", target.id)
+        try:
+            await interaction.followup.send(_lock_failure_text(locking, target.mention, kind, exc), allowed_mentions=none)
+        except Exception:
+            log.exception("/%s: could not tell the moderator it failed", command)
+        return
+    if kind != "thread" and not locking:
+        try:
+            await _lock_store.clear(target.id)
+        except OSError:  # harmless: the next /lock or /unlock sees that the saved settings are out of date
+            log.exception("/unlock: could not forget the saved settings of %s", target.id)
+    log.info(
+        "/%s: %s %s (%s) %s by %s (%s) in guild %s. reason=%r previous=%r",
+        command, noun, getattr(target, "name", "?"), target.id, word, moderator, moderator.id, guild.name, reason,
+        record["previous"] if record else None,
+    )
+
+    # --- Tell people. A failure here never undoes the change; it is reported to the moderator. ---
+    warnings: List[str] = []
+    here = interaction.channel is not None and interaction.channel.id == target.id
+    try:
+        await interaction.followup.send(_lock_public_text(locking, here, target, noun, reason), allowed_mentions=none)
+    except Exception:
+        log.exception("/%s: could not post the public message for %s", command, target.id)
+        warnings.append(f"⚠️ The {command} went through, but I couldn’t post the message in this channel.")
+    problem = await _mod_log(guild, _lock_audit_embed(locking, target, noun, moderator, interaction.channel, reason))
+    if problem:
+        warnings.append(
+            f"⚠️ The {command} went through, but I couldn’t post it to the mod-log channel ({problem}). "
+            "Please tell an admin; the details are in the bot’s logs."
+        )
+    if warnings:
+        try:
+            await interaction.followup.send("\n".join(warnings), ephemeral=True, allowed_mentions=none)
+        except Exception:
+            log.exception("/%s: could not show the moderator the warnings", command)
+
+
+async def _lock_run(
+    interaction: discord.Interaction, locking: bool, typed: Optional[str], reason: Optional[str],
+) -> None:
+    """The checks /lock and /unlock share. Nothing has been answered yet, so anything wrong is a private message."""
+    guild = interaction.guild
+    assert guild is not None  # guaranteed by guild_only()
+    moderator = interaction.user
+    none = discord.AllowedMentions.none()
+
+    async def refuse(text: str) -> None:
+        await interaction.response.send_message(text, ephemeral=True, allowed_mentions=none)
+
+    reason = (reason or "").strip() or None  # a blank reason counts as no reason
+    if typed and typed.strip():
+        target, problem = _lock_find(guild, typed)
+        if target is None:
+            await refuse(problem)
+            return
+    else:
+        target = interaction.channel  # no channel given: the one the command was typed in
+    kind = _lock_kind(target)
+    if kind is None:
+        await refuse(_lock_unsupported(target))
+        return
+    problem = _lock_problem(guild, moderator, target, kind)
+    if problem:
+        await refuse(problem)
+        return
+    if target.id in _lock_busy:
+        await refuse("Someone is already changing that channel. Please wait a moment and try again.")
+        return
+    _lock_busy.add(target.id)
+    try:
+        await _lock_do(interaction, guild, moderator, target, kind, locking, reason)
+    finally:
+        _lock_busy.discard(target.id)
+
+
+def _lock_choice(item: Any) -> app_commands.Choice[str]:
+    if isinstance(item, discord.Thread):
+        parent = item.parent
+        label = f"🧵 {item.name}" + (f" (in #{parent.name})" if parent is not None else "")
+    elif isinstance(item, discord.ForumChannel):
+        label = f"#{item.name} (forum)"
+    else:
+        label = f"#{item.name}"
+    return app_commands.Choice(name=label[:100], value=str(item.id))
+
+
+def _lock_choices(interaction: discord.Interaction, current: str, unlocking: bool) -> List[app_commands.Choice[str]]:
+    """The suggestions under the channel box of /lock and /unlock: channels, forums and open threads whose name contains
+    what has been typed so far, that this person may lock. /unlock only offers what is locked right now. A channel ID that
+    has been typed is offered as the first choice, so it can be picked as well as simply submitted. At most 25 are shown."""
+    guild = interaction.guild
+    user = interaction.user
+    if guild is None or not getattr(interaction.permissions, "manage_channels", False):
+        return []
+    text = current.strip()
+    choices: List[app_commands.Choice[str]] = []
+
+    typed_id = _parse_channel_id(text)
+    if typed_id is not None:
+        found = guild.get_channel_or_thread(typed_id)
+        if found is not None and _lock_kind(found) is not None:
+            choices.append(_lock_choice(found))
+        else:
+            choices.append(app_commands.Choice(name=f"Use the channel ID {typed_id}", value=str(typed_id)))
+
+    needle = (text[1:] if text.startswith("#") else text).strip().lower()
+    taken = {choice.value for choice in choices}
+    starts: List[Any] = []  # names that begin with the text come first
+    contains: List[Any] = []
+    for item in _lock_candidates(guild):
+        if str(item.id) in taken:
+            continue
+        is_locked = (item.locked if isinstance(item, discord.Thread) else _lock_store.get(item.id) is not None)
+        if is_locked != unlocking:
+            continue
+        name = item.name.lower()
+        if needle and needle not in name and needle.replace(" ", "-") not in name:
+            continue
+        try:
+            allowed = item.permissions_for(user)
+        except Exception:
+            continue
+        if not (allowed.view_channel and allowed.manage_channels):
+            continue
+        (starts if name.startswith(needle) else contains).append(item)
+        if len(starts) >= 25:
+            break
+    for item in starts + contains:
+        if len(choices) >= 25:
+            break
+        choices.append(_lock_choice(item))
+    return choices[:25]
+
+
+@bot.tree.command(name="lock", description="Stop @everyone sending messages in a channel, forum or thread.")
+@app_commands.describe(
+    channel="Leave empty to lock this one. Or pick a channel, forum or thread as you type, or enter its ID.",
+    reason="Optional reason, shown in the channel and saved in the audit log and the mod-log channel.",
+)
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.checks.has_permissions(manage_channels=True)
+@app_commands.guild_only()
+async def lock_command(
+    interaction: discord.Interaction,
+    # A text box with suggestions, not a channel picker, so a channel's ID can be pasted into it (like /ban's user box).
+    channel: Optional[app_commands.Range[str, 1, 100]] = None,
+    reason: Optional[app_commands.Range[str, 1, 300]] = None,
+):
+    await _lock_run(interaction, True, channel, reason)
+
+
+@lock_command.autocomplete("channel")
+async def lock_channel_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    return _lock_choices(interaction, current, False)
+
+
+@bot.tree.command(name="unlock", description="Undo /lock: put @everyone's permission back exactly as it was.")
+@app_commands.describe(
+    channel="Leave empty to unlock this one. Or pick a locked channel, forum or thread, or enter its ID.",
+    reason="Optional reason, shown in the channel and saved in the audit log and the mod-log channel.",
+)
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.checks.has_permissions(manage_channels=True)
+@app_commands.guild_only()
+async def unlock_command(
+    interaction: discord.Interaction,
+    channel: Optional[app_commands.Range[str, 1, 100]] = None,
+    reason: Optional[app_commands.Range[str, 1, 300]] = None,
+):
+    await _lock_run(interaction, False, channel, reason)
+
+
+@unlock_command.autocomplete("channel")
+async def unlock_channel_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    return _lock_choices(interaction, current, True)
 
 
 # --------------------------------------------------------------------------
