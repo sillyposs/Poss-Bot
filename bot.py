@@ -60,6 +60,12 @@ Seven slash commands:
               (see "/tkl: the Add Gamertag step" further down). The command itself is unchanged.
               The mod-log entry has a Gamertag line: "Not set yet" until that button has been used,
               and the name that was set afterwards (the bot edits the entry).
+              A member who is NOT Unverified but has the Limited Access role is offered a promotion
+              instead: the moderator gets a private "are you sure you want to grant them Full
+              Access?" with a green Yes and a red No. Yes swaps the Limited Access role for The
+              Kings Legion role and writes a separate "promoted" entry to the mod-log (no public
+              message, no Add Gamertag step); No, or no answer, changes nothing (see "/tkl:
+              promoting a Limited Access member to Full Access" further down).
 
   /commands   Lists this bot's commands and what they do. Open to everyone.
 
@@ -2979,6 +2985,13 @@ async def _tkl_verify(
             await reply(f"I couldn’t find the Limited Access role (ID {LIMITED_ACCESS_ROLE_ID}) in this server, so I haven’t changed anything.")
             return
 
+        # --- Not unverified, but on Limited Access? Then this is a promotion to Full Access (see
+        # "/tkl: promoting a Limited Access member to Full Access" below). Anyone who IS unverified, and
+        # anyone with neither role, never gets in here and is handled exactly as before.
+        if not _has_role(member, UNVERIFIED_ROLE_ID) and _has_role(member, LIMITED_ACCESS_ROLE_ID):
+            handed_off = await _tkl_promote_offer(interaction, guild, moderator, member, kings, limited, note, key)
+            return
+
         # --- The member must actually be unverified. ---------------------------------------------------
         if not _has_role(member, UNVERIFIED_ROLE_ID):
             await reply(
@@ -3089,6 +3102,381 @@ async def tkl(
     # _tkl_verify releases _tkl_busy itself on every path (an early validation failure, or once
     # _TklAccessView takes over and later releases it when a button is pressed, errors, or times out).
     await _tkl_verify(interaction, guild, moderator, member, note, key)
+
+
+# --------------------------------------------------------------------------
+# /tkl: promoting a Limited Access member to Full Access
+#
+# Some time after /tkl gave someone Limited Access, a General can run /tkl @member on them again to
+# upgrade them. /tkl still looks for the Unverified role first, exactly as before. Only a member who does
+# NOT have it but DOES have the Limited Access role gets this instead (the check is in _tkl_verify): the
+# moderator is asked, privately, "are you sure you want to grant them Full Access?" with a green Yes and a
+# red No. Yes swaps the Limited Access role for The Kings Legion role and writes a separate "promoted"
+# entry to the mod-log. There is no public welcome message and no Add Gamertag step, because the member
+# has been in the server all along. No, or no answer, changes nothing.
+#
+# It reuses the pieces of the verification: the same staff-role check, the same one-at-a-time lock
+# (_tkl_busy), the same checks that the bot may change the roles and can use the mod-log, and the same
+# roll-back (_tkl_restore) when the second role change fails.
+# --------------------------------------------------------------------------
+
+
+def _tkl_promote_embed(member: discord.Member, moderator: Any) -> discord.Embed:
+    """The private, ephemeral question shown before a Limited Access member is promoted."""
+    return discord.Embed(
+        title="Grant Full Access?",
+        description=(
+            f"{member.mention} currently has Limited Access, are you sure you want to grant them Full Access?\n\n"
+            "**Yes** gives them Full Access and takes Limited Access away. Nothing is announced in the channel; "
+            "it is only recorded in the mod-log. **No** changes nothing.\n\n"
+            f"Only {discord.utils.escape_markdown(moderator.display_name)} can answer this, and it expires "
+            f"after {_TKL_ACCESS_TIMEOUT} seconds if nobody does."
+        ),
+        colour=discord.Colour(0x3498DB),
+    )
+
+
+def _tkl_promote_audit_embed(member: discord.Member, moderator: discord.Member, note: Optional[str]) -> discord.Embed:
+    # Plain text only (names, never mentions): this embed must not ping or link anyone.
+    embed = discord.Embed(
+        title="Member promoted to Full Access",
+        description=(
+            f"**{discord.utils.escape_markdown(member.display_name)}** was promoted from Limited Access to "
+            f"Full Access by **{discord.utils.escape_markdown(moderator.display_name)}**."
+        ),
+        colour=discord.Colour(0xF1C40F),
+    )
+    embed.add_field(name="Member", value=_who(member.display_name, member.id), inline=True)
+    embed.add_field(name="Promoted by", value=_who(moderator.display_name, moderator.id), inline=True)
+    embed.add_field(name="Access level", value="Limited Access → Full Access", inline=True)
+    if note:
+        embed.add_field(name="Note from moderator:", value=note, inline=False)
+    embed.timestamp = _utcnow()
+    return embed
+
+
+def _tkl_promote_why(exc: BaseException) -> str:
+    """Like _tkl_why, but names the two roles a promotion changes."""
+    if isinstance(exc, discord.Forbidden):
+        return "Discord wouldn’t let me change their roles (is my role above the Limited Access role and The Kings Legion role?)"
+    return _tkl_why(exc)
+
+
+async def _tkl_promote_swap_roles(
+    member: discord.Member, limited: discord.Role, kings: discord.Role, had_kings: bool,
+    moderator: discord.Member, note: Optional[str],
+) -> Optional[str]:
+    """Give The Kings Legion role, then take the Limited Access role away.
+
+    Returns None when both worked. Otherwise it returns the private message for the moderator, and the
+    roles have been put back as they were whenever that was possible.
+
+    The order is the same deliberate one as in _tkl_swap_roles: even if the second step fails and the
+    roll-back fails too, the member keeps at least one of the two roles (most likely both, which is Full
+    Access), never neither.
+    """
+    name = discord.utils.escape_markdown(member.display_name)
+    limited_name = discord.utils.escape_markdown(limited.name)
+    kings_name = discord.utils.escape_markdown(kings.name)
+    reason = f"Promoted to Full Access by {moderator.display_name} ({moderator.id}) via /tkl"
+    if note:
+        reason += f": {note}"
+    reason = reason[:512]  # Discord's limit for audit-log reasons
+    undo_reason = f"Rolling back a failed /tkl promotion by {moderator.display_name} ({moderator.id})"
+    gone = f"**{name}** is no longer in the server, so nothing was changed."
+
+    added = False
+    if not had_kings:
+        try:
+            await member.add_roles(kings, reason=reason)
+            added = True
+        except Exception as exc:
+            if _tkl_member_gone(exc):
+                log.warning("/tkl: %s (%s) left the server before they could be promoted", member, member.id)
+                return gone
+            log.exception("/tkl: could not give the %s role to %s (%s)", kings.name, member, member.id)
+            if _tkl_failed_cleanly(exc):
+                return (
+                    f"I couldn’t promote **{name}**: {_tkl_promote_why(exc)}. "
+                    "Their roles are unchanged and nothing was logged."
+                )
+            # A timeout or server error: the role may have been added anyway, so make sure it is gone.
+            failed = await _tkl_restore(
+                member, limited, kings, remove_granted=True, readd_unverified=False, reason=undo_reason
+            )
+            if failed is None:
+                return gone
+            if failed:
+                return (
+                    f"⚠️ I couldn’t promote **{name}**: {_tkl_promote_why(exc)}. I also couldn’t confirm that the "
+                    f"{kings_name} role wasn’t added, so please check their roles in Discord. Nothing was logged."
+                )
+            return (
+                f"I couldn’t promote **{name}**: {_tkl_promote_why(exc)}. "
+                "Their roles are unchanged and nothing was logged."
+            )
+
+    try:
+        await member.remove_roles(limited, reason=reason)
+    except Exception as exc:
+        if _tkl_member_gone(exc):
+            log.warning("/tkl: %s (%s) left the server before they could be promoted", member, member.id)
+            return gone
+        log.exception("/tkl: could not take the %s role off %s (%s)", limited.name, member, member.id)
+        failed = await _tkl_restore(
+            member, limited, kings,
+            remove_granted=added, readd_unverified=not _tkl_failed_cleanly(exc), reason=undo_reason,
+        )
+        if failed is None:
+            return gone
+        if failed:
+            return (
+                f"⚠️ I couldn’t finish promoting **{name}**: {_tkl_promote_why(exc)}. I also couldn’t undo my changes "
+                f"({', '.join(discord.utils.escape_markdown(role) for role in failed)}), so their roles may be wrong now "
+                f"(for example both {limited_name} and {kings_name}). Please check them in Discord. Nothing was logged."
+            )
+        return (
+            f"I couldn’t promote **{name}**: {_tkl_promote_why(exc)}. I put their roles back exactly as they were, "
+            "and nothing was logged."
+        )
+    return None
+
+
+async def _tkl_promote_finish(
+    interaction: discord.Interaction, guild: discord.Guild, moderator: discord.Member, member: discord.Member,
+    kings: discord.Role, limited: discord.Role, note: Optional[str], audit_channel: discord.TextChannel,
+) -> None:
+    """Runs once the green Yes has been pressed: swaps the Limited Access role for The Kings Legion role,
+    writes the mod-log entry, and updates the private question with the private result. Nothing is posted
+    in the channel and there is no Add Gamertag step.
+
+    Like _tkl_finish, it answers the button press straight away (Discord only waits 3 seconds for that)
+    with a short placeholder, then does the slower work.
+    """
+    name = discord.utils.escape_markdown(member.display_name)
+    await interaction.response.edit_message(content=f"Promoting **{name}**…", embed=None, view=None)
+
+    async def finish(text: str) -> None:
+        # The question is private (ephemeral): see _tkl_finish for why it is changed through the button press.
+        try:
+            await interaction.edit_original_response(content=text, allowed_mentions=discord.AllowedMentions.none())
+            return
+        except Exception:
+            log.warning("/tkl: could not update the promotion question with the result", exc_info=True)
+        await _tkl_reply(interaction, text)
+
+    # Some time has passed since the question was asked: look at the member again before touching anything.
+    try:
+        member = await guild.fetch_member(member.id)
+    except discord.NotFound:
+        await finish(f"**{name}** is no longer in the server, so nothing was changed.")
+        return
+    except discord.HTTPException:
+        log.warning("/tkl: could not look %s (%s) up again before promoting them; using what I already have", member, member.id)
+    name = discord.utils.escape_markdown(member.display_name)
+    if _has_role(member, UNVERIFIED_ROLE_ID) or not _has_role(member, LIMITED_ACCESS_ROLE_ID):
+        await finish(
+            f"**{name}**’s roles have changed since you were asked (a promotion needs the Limited Access role "
+            "and not the Unverified role), so I haven’t changed anything. Run /tkl again if you still want to."
+        )
+        return
+
+    had_kings = _has_role(member, kings.id)
+    failure = await _tkl_promote_swap_roles(member, limited, kings, had_kings, moderator, note)
+    if failure is not None:
+        await finish(failure)  # nothing is logged when the promotion failed
+        return
+    log.info(
+        "/tkl: %s (%s) promoted from Limited Access to Full Access by %s (%s) in guild %s",
+        member, member.id, moderator, moderator.id, guild.name,
+    )
+
+    # --- Record it. A failure here never undoes the roles; it is reported to the moderator. ----------
+    shown_note = discord.utils.escape_mentions(note) if note else None
+    warnings: List[str] = []
+    try:
+        await audit_channel.send(
+            embed=_tkl_promote_audit_embed(member, moderator, shown_note), allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except Exception:
+        log.exception("/tkl: could not post the promotion audit entry for %s (%s)", member, member.id)
+        warnings.append(
+            "⚠️ The roles were changed, but I couldn’t post the audit entry. "
+            "Please tell an admin; the details are in the bot's logs."
+        )
+
+    limited_name = discord.utils.escape_markdown(limited.name)
+    kings_name = discord.utils.escape_markdown(kings.name)
+    if had_kings:
+        done = f"✅ Promoted **{name}** to **Full Access**: removed {limited_name}. They already had {kings_name}."
+    else:
+        done = f"✅ Promoted **{name}** to **Full Access**: removed {limited_name} and added {kings_name}."
+    await finish("\n".join([done] + warnings))
+
+
+class _TklPromoteView(discord.ui.View):
+    """The green Yes / red No buttons under the "grant them Full Access?" question. This message is
+    ephemeral, so only the moderator who ran /tkl ever sees it; nothing changes until Yes is pressed."""
+
+    def __init__(
+        self, guild: discord.Guild, moderator: discord.Member, target: discord.Member,
+        kings: discord.Role, limited: discord.Role, note: Optional[str],
+        audit_channel: discord.TextChannel, key: str,
+    ) -> None:
+        super().__init__(timeout=_TKL_ACCESS_TIMEOUT)
+        self.guild = guild
+        self.moderator = moderator
+        self.target = target
+        self.kings = kings
+        self.limited = limited
+        self.note = note
+        self.audit_channel = audit_channel
+        self.key = key
+        self.message: Optional[discord.Message] = None  # the question itself; set once it has been sent
+        self._answered = False  # set by the first press of either button, so nothing can be processed twice
+        self._released = False  # set once _tkl_busy has been freed, so that only ever happens once
+
+    def _release(self) -> None:
+        """Let another /tkl on this member start. Safe to call more than once."""
+        if not self._released:
+            self._released = True
+            _tkl_busy.discard(self.key)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.moderator.id:
+            await interaction.response.send_message(
+                "Only the moderator who ran /tkl for this member can use these buttons.", ephemeral=True,
+            )
+            return False
+        if not _is_tkl_staff(interaction.user):
+            await interaction.response.send_message(
+                "You no longer have a staff role, so you can’t answer this.", ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _first_answer(self, interaction: discord.Interaction) -> bool:
+        """True for the first press only. Any later press (a double click, or No right after Yes) is ignored."""
+        if self._answered:
+            await interaction.response.defer()
+            return False
+        self._answered = True  # no await between the check and this line, so two presses can't both get through
+        self.stop()
+        return True
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._first_answer(interaction):
+            return
+        try:
+            await _tkl_promote_finish(
+                interaction, self.guild, self.moderator, self.target, self.kings, self.limited, self.note,
+                self.audit_channel,
+            )
+        finally:
+            self._release()
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._first_answer(interaction):
+            return
+        try:
+            name = discord.utils.escape_markdown(self.target.display_name)
+            await interaction.response.edit_message(
+                content=f"Cancelled. **{name}** still has Limited Access and nothing was changed.",
+                embed=None, view=None,
+            )
+        finally:
+            self._release()
+
+    async def on_timeout(self) -> None:
+        if self._answered:
+            return
+        self._answered = True
+        self._release()
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content=(
+                        "Nobody answered in time, so nothing was changed. "
+                        "Run /tkl again if you still want to grant them Full Access."
+                    ),
+                    embed=None, view=None,
+                )
+            except Exception:
+                log.warning("/tkl: could not update the promotion question after it timed out", exc_info=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        log.error("Unhandled error in the /tkl promotion buttons", exc_info=error)
+        self._release()
+        text = "Something went wrong with that button. Please check their roles in Discord before trying again."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except Exception:
+            log.warning("/tkl: could not tell the moderator that a promotion button failed", exc_info=True)
+
+
+async def _tkl_promote_offer(
+    interaction: discord.Interaction, guild: discord.Guild, moderator: discord.Member, member: discord.Member,
+    kings: discord.Role, limited: discord.Role, note: Optional[str], key: str,
+) -> bool:
+    """Called by _tkl_verify for a member who is not Unverified but has the Limited Access role.
+
+    Checks what a promotion needs (the same kind of checks as a verification; nothing is changed here), then
+    asks the moderator. Returns True once the question has been sent: _TklPromoteView then owns releasing
+    _tkl_busy. Returns False after a refusal, when nothing was changed and the caller must release it.
+    """
+
+    async def reply(text: str) -> None:
+        await _tkl_reply(interaction, text)
+
+    name = discord.utils.escape_markdown(member.display_name)
+
+    # --- Can the bot actually make both changes? ------------------------------------------------------
+    me = guild.me
+    if me is None or not me.guild_permissions.manage_roles:
+        await reply("I don’t have the **Manage Roles** permission, so I can’t change anyone’s roles. I haven’t changed anything.")
+        return False
+    for role in (kings, limited):
+        role_name = discord.utils.escape_markdown(role.name)
+        if role.managed:
+            await reply(
+                f"The **{role_name}** role is managed by an integration, so it can’t be given or taken away "
+                "manually. I haven’t changed anything."
+            )
+            return False
+        if not me.top_role > role:
+            await reply(
+                f"My highest role isn’t above the **{role_name}** role, so Discord won’t let me give or remove it. "
+                "Please move my role above it (Server Settings → Roles). I haven’t changed anything."
+            )
+            return False
+    if member.id == guild.owner_id or not me.top_role > member.top_role:
+        await reply(
+            f"I can’t change **{name}**’s roles because their highest role is at or above mine "
+            "(or they own the server). I haven’t changed anything."
+        )
+        return False
+
+    # --- The mod-log must be usable BEFORE any role is touched. ---------------------------------------
+    audit_channel, problem = _tkl_audit_channel(guild)
+    if audit_channel is None:
+        await reply(
+            f"I can’t use the mod-log channel ({problem}), so I haven’t changed any roles. "
+            "Please ask an admin to check it."
+        )
+        return False
+
+    # --- Ask, instead of changing anything yet. -------------------------------------------------------
+    view = _TklPromoteView(guild, moderator, member, kings, limited, note, audit_channel, key)
+    view.message = await interaction.followup.send(
+        embed=_tkl_promote_embed(member, moderator), view=view, ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    return True
 
 
 # --------------------------------------------------------------------------
