@@ -67,6 +67,16 @@ Seven slash commands:
               message, no Add Gamertag step); No, or no answer, changes nothing (see "/tkl:
               promoting a Limited Access member to Full Access" further down).
 
+  /announce   Posts an announcement embed (a title, a description and an optional image, with
+              "Announced by <name>" as its footer) in a channel the moderator picks, with an
+              optional ping above it for @everyone, @here and/or chosen roles. It opens a private
+              draft: a channel picker, a role picker, @everyone / @here buttons, a "Write
+              announcement" button (a form), a live preview, Send and Cancel. Requires Manage
+              Messages. The pings are sent by the bot itself, with its own permissions, so they
+              work even for a moderator who does not have Discord's "Mention @everyone, @here and
+              All Roles" permission. Announcements are not logged anywhere; the footer of each one
+              says who sent it.
+
   /commands   Lists this bot's commands and what they do. Open to everyone.
 
   /define     Looks a word or phrase up in Merriam-Webster's Collegiate
@@ -2133,6 +2143,7 @@ async def commands_help(interaction: discord.Interaction):
         "`/sos` -- Calls for help in Cyrodiil PvP and pings the SOS role. Shared 30-minute cooldown "
         "for the whole server -- no exceptions.\n"
         "`/roster` -- A short guide to using the roster and signing up for a group. Anyone can use it.\n"
+        "`/announce` -- Posts an announcement in a channel you choose, with optional pings. Needs Manage Messages.\n"
         + _esom_commands_line(interaction) +
         "`/commands` -- Shows this list.",
         ephemeral=True,
@@ -9718,6 +9729,473 @@ async def unlock_command(
 @unlock_command.autocomplete("channel")
 async def unlock_channel_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     return _lock_choices(interaction, current, True)
+
+
+# --------------------------------------------------------------------------
+# /announce
+#
+# Posts an announcement, as an embed, in a channel the moderator picks, with an optional ping above it.
+#
+# /announce opens a private draft (only the moderator can see it) with:
+#   * a channel picker,
+#   * a role picker, and @everyone / @here buttons, for the pings,
+#   * a "Write announcement" button that opens a form: Title, Description and an optional Image link,
+#   * a live preview of the embed exactly as it will be posted, with the footer "Announced by <name>",
+#   * Send and Cancel.
+# Nothing is posted until Send is pressed.
+#
+# Who may use it: members with Manage Messages (the same two decorators the other staff commands use). The buttons
+# check it again, so someone who loses the permission part-way through can't finish the draft.
+#
+# The pings do NOT depend on the moderator's own permissions. The announcement is an ordinary message that the BOT sends
+# to the channel (channel.send, not a reply to the command), so Discord applies the bot's permissions -- Poss Bot is an
+# Administrator -- and not the moderator's. A moderator without Discord's "Mention @everyone, @here and All Roles"
+# permission can still ping @everyone, @here and any role, even a role that is not set to "mentionable". The only text
+# that can ping is the line the bot builds itself from the picks above the embed (allowed_mentions lists exactly those
+# and nothing else); nothing typed into the Title or Description can ping anyone, because mentions inside an embed never do.
+#
+# Nothing is logged: no mod-log entry and no console line for an announcement (the footer of each one already says who
+# sent it). Only failures are written to the console log, so that a problem can be tracked down.
+# --------------------------------------------------------------------------
+
+_ANNOUNCE_COLOUR = 0x3498DB         # the stripe down the side of the announcement (and of the preview)
+_ANNOUNCE_TIMEOUT = 600             # seconds a draft stays usable after the last thing the moderator pressed
+_ANNOUNCE_TITLE_MAX = 256           # Discord's limit for an embed title
+_ANNOUNCE_DESCRIPTION_MAX = 4000    # the longest a form box can be (an embed could hold 4096)
+_ANNOUNCE_IMAGE_MAX = 1000          # the longest image link accepted
+_ANNOUNCE_MAX_ROLES = 25            # the most roles one Discord role picker can hold
+
+
+class _AnnounceDraft:
+    """What the moderator has put together so far. Nothing here goes anywhere until Send is pressed."""
+
+    def __init__(self) -> None:
+        self.channel_id: Optional[int] = None
+        self.role_ids: List[int] = []
+        self.everyone = False
+        self.here = False
+        self.title = ""
+        self.description = ""
+        self.image_url = ""
+
+    def has_content(self) -> bool:
+        """True once there is something to post (a title, a description or an image)."""
+        return bool(self.title or self.description or self.image_url)
+
+
+def _announce_clean_link(text: str) -> Tuple[str, str]:
+    """(the link, "") for a usable image link -- ("", "") when none was given -- or ("", why not) for one that isn't."""
+    link = text.strip()
+    if not link:
+        return "", ""
+    if len(link) > _ANNOUNCE_IMAGE_MAX:
+        return "", f"it is longer than {_ANNOUNCE_IMAGE_MAX} characters"
+    if not link.isprintable() or any(ch.isspace() for ch in link):
+        return "", "it has a space or a line break in it"
+    try:
+        parts = urllib.parse.urlsplit(link)
+    except ValueError:  # e.g. "https://[abc": Python can't even read it as a link
+        return "", "it has to be a web link that starts with https://"
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        return "", "it has to be a web link that starts with https://"
+    return link, ""
+
+
+def _announce_embed(draft: "_AnnounceDraft", moderator: Any, preview: bool = False) -> discord.Embed:
+    """The announcement itself, and (preview=True) the same thing shown to the moderator while they are drafting it.
+    The footer always says who posted it: footers are plain text, so it is their server name, not a mention."""
+    description = draft.description or None
+    if preview and not draft.has_content():
+        description = "*Nothing written yet. Press **Write announcement** to add a title and a description.*"
+    embed = discord.Embed(
+        title=draft.title or None, description=description, colour=discord.Colour(_ANNOUNCE_COLOUR),
+    )
+    if draft.image_url:
+        embed.set_image(url=draft.image_url)
+    embed.set_footer(text=f"Announced by {moderator.display_name}", icon_url=moderator.display_avatar.url)
+    return embed
+
+
+def _announce_pings(
+    guild: discord.Guild, draft: "_AnnounceDraft",
+) -> Tuple[str, discord.AllowedMentions, List[discord.Role], int]:
+    """What goes above the announcement so that it pings: (that line, exactly who may be pinged, the roles in it,
+    how many picked roles no longer exist). The line is made only from the picks, never from anything typed."""
+    words: List[str] = []
+    if draft.everyone:
+        words.append("@everyone")
+    elif draft.here:
+        words.append("@here")
+    roles: List[discord.Role] = []
+    gone = 0
+    for role_id in draft.role_ids:
+        role = guild.get_role(role_id)
+        if role is None:
+            gone += 1
+            continue
+        roles.append(role)
+        words.append(role.mention)
+    allowed = discord.AllowedMentions(
+        everyone=bool(draft.everyone or draft.here), users=False, roles=roles if roles else False, replied_user=False,
+    )
+    return " ".join(words), allowed, roles, gone
+
+
+def _announce_ping_summary(guild: discord.Guild, draft: "_AnnounceDraft") -> str:
+    """Who will be pinged, for the moderator: never a ping itself, because it is only ever shown in the private draft
+    and in the private result."""
+    parts: List[str] = []
+    if draft.everyone:
+        parts.append("**@everyone**")
+    elif draft.here:
+        parts.append("**@here**")
+    for role_id in draft.role_ids:
+        role = guild.get_role(role_id)
+        if role is not None:
+            parts.append(role.mention)
+    return ", ".join(parts) if parts else "nobody"
+
+
+def _announce_status(guild: discord.Guild, draft: "_AnnounceDraft", notice: str = "") -> str:
+    """The text above the preview in the private draft."""
+    lines = ["**New announcement.** Only you can see this draft; nothing is posted until you press **Send**."]
+    channel_text = f"<#{draft.channel_id}>" if draft.channel_id is not None else "*not chosen yet*"
+    lines.append(f"**Channel:** {channel_text}")
+    lines.append(f"**Pings:** {_announce_ping_summary(guild, draft)}")
+    if draft.everyone:
+        lines.append("⚠️ **@everyone** notifies every member of the server.")
+    elif draft.here:
+        lines.append("⚠️ **@here** notifies every member who is online.")
+    todo = []
+    if draft.channel_id is None:
+        todo.append("choose a channel")
+    if not draft.has_content():
+        todo.append("press **Write announcement**")
+    if todo:
+        lines.append("**Still to do:** " + " and ".join(todo) + ".")
+    if notice:
+        lines.append(notice)
+    return "\n".join(lines)
+
+
+class _AnnounceModal(discord.ui.Modal):
+    """The form behind "Write announcement": Title, Description and an optional Image link. It starts with what
+    has been written so far, so pressing the button again edits the draft instead of starting over."""
+
+    def __init__(self, owner: "_AnnounceView") -> None:
+        super().__init__(title="Write the announcement", timeout=_ANNOUNCE_TIMEOUT)
+        self.owner = owner
+        draft = owner.draft
+        self.title_input = discord.ui.TextInput(
+            label="Title", style=discord.TextStyle.short, required=False, max_length=_ANNOUNCE_TITLE_MAX,
+            default=draft.title or None, placeholder="The heading at the top (optional)",
+        )
+        self.description_input = discord.ui.TextInput(
+            label="Description", style=discord.TextStyle.paragraph, required=False, max_length=_ANNOUNCE_DESCRIPTION_MAX,
+            default=draft.description or None, placeholder="The announcement. **Bold**, links and line breaks all work.",
+        )
+        self.image_input = discord.ui.TextInput(
+            label="Image link (optional)", style=discord.TextStyle.short, required=False, max_length=_ANNOUNCE_IMAGE_MAX,
+            default=draft.image_url or None, placeholder="https://...",
+        )
+        self.add_item(self.title_input)
+        self.add_item(self.description_input)
+        self.add_item(self.image_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        view = self.owner
+        if view.closed:
+            await interaction.response.send_message(
+                "That draft isn’t open any more. Run /announce again to start a new one.", ephemeral=True,
+            )
+            return
+        if interaction.user.id != view.moderator.id or not getattr(interaction.permissions, "manage_messages", False):
+            await interaction.response.send_message("You can’t change this announcement.", ephemeral=True)
+            return
+        view.latest = interaction
+        view.timeout = _ANNOUNCE_TIMEOUT  # a submitted form is activity too: the draft's idle clock starts again
+        title = self.title_input.value.strip()
+        description = self.description_input.value.strip()
+        notices: List[str] = []
+        if len(title) > _ANNOUNCE_TITLE_MAX:
+            notices.append(f"⚠️ The title wasn’t saved: it is longer than {_ANNOUNCE_TITLE_MAX} characters.")
+            title = view.draft.title
+        if len(description) > _ANNOUNCE_DESCRIPTION_MAX:
+            notices.append(f"⚠️ The description wasn’t saved: it is longer than {_ANNOUNCE_DESCRIPTION_MAX} characters.")
+            description = view.draft.description
+        link, problem = _announce_clean_link(self.image_input.value)
+        if problem:
+            notices.append(f"⚠️ The image link wasn’t saved: {problem}.")
+            link = view.draft.image_url
+        view.draft.title = title
+        view.draft.description = description
+        view.draft.image_url = link
+        await view.refresh(interaction, "\n".join(notices))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.error("Unhandled error in the /announce form", exc_info=error)
+        try:
+            text = "Something went wrong saving that. Nothing was posted. Please try again."
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except Exception:
+            log.warning("/announce: could not tell the moderator that the form failed", exc_info=True)
+
+
+class _AnnounceView(discord.ui.View):
+    """The private draft: pickers, buttons and the preview. Only the moderator who ran /announce can use it."""
+
+    def __init__(self, guild: discord.Guild, moderator: Any) -> None:
+        super().__init__(timeout=_ANNOUNCE_TIMEOUT)
+        self.guild = guild
+        self.moderator = moderator
+        self.draft = _AnnounceDraft()
+        self.latest: Optional[discord.Interaction] = None  # the newest interaction: its token is used to edit on a timeout
+        self.busy = False     # True while Send is working, so a second press can't post it twice
+        self.closed = False   # True once the draft was sent, cancelled or timed out
+        self.sync()
+
+    # ----- what the draft looks like -------------------------------------------------------------------------
+
+    def sync(self) -> None:
+        """Make the pickers and buttons match the draft (the pickers keep showing what was chosen)."""
+        draft = self.draft
+        self.pick_channel.default_values = (
+            [discord.SelectDefaultValue(id=draft.channel_id, type=discord.SelectDefaultValueType.channel)]
+            if draft.channel_id is not None else []
+        )
+        self.pick_roles.default_values = [
+            discord.SelectDefaultValue(id=role_id, type=discord.SelectDefaultValueType.role)
+            for role_id in draft.role_ids if self.guild.get_role(role_id) is not None
+        ]
+        self.everyone_button.label = "✔ @everyone" if draft.everyone else "@everyone"
+        self.everyone_button.style = discord.ButtonStyle.primary if draft.everyone else discord.ButtonStyle.secondary
+        self.here_button.label = "✔ @here" if draft.here else "@here"
+        self.here_button.style = discord.ButtonStyle.primary if draft.here else discord.ButtonStyle.secondary
+        for item in self.children:
+            item.disabled = self.busy
+        if not self.busy:
+            self.send_button.disabled = not (draft.channel_id is not None and draft.has_content())
+
+    def frame(self, notice: str = "") -> Dict[str, Any]:
+        """Everything needed to show the draft: its text, the preview, and the pickers and buttons."""
+        return {
+            "content": _announce_status(self.guild, self.draft, notice),
+            "embeds": [_announce_embed(self.draft, self.moderator, preview=True)],
+            "view": self,
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
+
+    async def refresh(self, interaction: discord.Interaction, notice: str = "") -> None:
+        """Show the draft again after a pick, a toggle or the form (this answers the interaction)."""
+        self.sync()
+        await interaction.response.edit_message(**self.frame(notice))
+
+    # ----- who may use it ------------------------------------------------------------------------------------
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.moderator.id:
+            await interaction.response.send_message(
+                "Only the moderator who ran /announce can use this.", ephemeral=True,
+            )
+            return False
+        if not getattr(interaction.permissions, "manage_messages", False):
+            await interaction.response.send_message(
+                "You no longer have the Manage Messages permission, so you can’t use this.", ephemeral=True,
+            )
+            return False
+        if self.busy:  # Send is already working on it: ignore any other press
+            await interaction.response.defer()
+            return False
+        self.latest = interaction
+        return True
+
+    # ----- the pickers -----------------------------------------------------------------------------------------
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect, placeholder="1. Choose the channel to post in",
+        channel_types=[discord.ChannelType.text, discord.ChannelType.news], min_values=1, max_values=1, row=0,
+    )
+    async def pick_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect) -> None:
+        self.draft.channel_id = select.values[0].id if select.values else None
+        await self.refresh(interaction)
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect, placeholder="2. Choose roles to ping (optional)",
+        min_values=0, max_values=_ANNOUNCE_MAX_ROLES, row=1,
+    )
+    async def pick_roles(self, interaction: discord.Interaction, select: discord.ui.RoleSelect) -> None:
+        role_ids: List[int] = []
+        for role in select.values:
+            if role.is_default():  # the @everyone role, if Discord lists it: that is what the @everyone button is for
+                self.draft.everyone = True
+                self.draft.here = False
+            elif role.id not in role_ids:
+                role_ids.append(role.id)
+        self.draft.role_ids = role_ids
+        await self.refresh(interaction)
+
+    # ----- the buttons -----------------------------------------------------------------------------------------
+
+    @discord.ui.button(label="Write announcement", emoji="✏️", style=discord.ButtonStyle.primary, row=2)
+    async def write_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(_AnnounceModal(self))
+
+    @discord.ui.button(label="@everyone", style=discord.ButtonStyle.secondary, row=2)
+    async def everyone_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.draft.everyone = not self.draft.everyone
+        if self.draft.everyone:
+            self.draft.here = False  # @everyone already includes everybody @here would reach
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="@here", style=discord.ButtonStyle.secondary, row=2)
+    async def here_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.draft.here = not self.draft.here
+        if self.draft.here:
+            self.draft.everyone = False
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="Send", emoji="✅", style=discord.ButtonStyle.success, row=3, disabled=True)
+    async def send_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        guild = self.guild
+        draft = self.draft
+        if not draft.has_content():
+            await self.refresh(interaction, "⚠️ Write the announcement first (press **Write announcement**).")
+            return
+        if draft.channel_id is None:
+            await self.refresh(interaction, "⚠️ Choose a channel first.")
+            return
+        channel = guild.get_channel(draft.channel_id)
+        if channel is None:
+            await self.refresh(interaction, "⚠️ That channel doesn’t exist any more. Please choose another one.")
+            return
+        if not isinstance(channel, discord.TextChannel):
+            await self.refresh(interaction, "⚠️ I can only post in text and announcement channels. Please choose another one.")
+            return
+        if not channel.permissions_for(interaction.user).view_channel:
+            await self.refresh(interaction, f"⚠️ You can’t see {channel.mention}, so you can’t post there. Please choose another one.")
+            return
+        problem = _cannot_post_in(channel, guild.me)
+        if problem:
+            await self.refresh(interaction, f"⚠️ I can’t post in {channel.mention} ({problem}). Nothing was posted.")
+            return
+        line, allowed, roles, gone = _announce_pings(guild, draft)
+        if line and not channel.permissions_for(guild.me).mention_everyone:
+            await self.refresh(
+                interaction,
+                f"⚠️ I don’t have the **Mention @everyone, @here and All Roles** permission in {channel.mention}, so the "
+                "pings wouldn’t work. Nothing was posted.",
+            )
+            return
+
+        # Answer the button at once (Discord only waits 3 seconds), switch the buttons off so it can't be sent twice,
+        # then post.
+        self.busy = True
+        self.sync()
+        await interaction.response.edit_message(
+            content=f"Posting in {channel.mention}…", embeds=[_announce_embed(draft, self.moderator, preview=True)],
+            view=self, allowed_mentions=discord.AllowedMentions.none(),
+        )
+        try:
+            # An ordinary message from the bot, NOT a reply to the command: that is what makes Discord apply the bot's
+            # permissions, not the moderator's, to the pings above the embed.
+            message = await channel.send(
+                content=line or None, embed=_announce_embed(draft, self.moderator), allowed_mentions=allowed,
+            )
+        except Exception as exc:
+            log.exception("/announce: could not post in #%s (%s)", getattr(channel, "name", "?"), channel.id)
+            self.busy = False
+            self.sync()
+            if _tkl_failed_cleanly(exc):
+                why = (
+                    "Discord wouldn’t let me" if isinstance(exc, discord.Forbidden)
+                    else f"Discord returned an error ({getattr(exc, 'status', '?')}) when I tried to"
+                )
+                notice = f"⚠️ {why} post in {channel.mention}. Nothing was posted."
+                if getattr(exc, "status", None) == 400 and draft.image_url:
+                    notice += " If it keeps failing, try removing the image link."
+            else:
+                notice = (
+                    f"⚠️ Discord didn’t answer, so I can’t tell whether it was posted. Please look in {channel.mention} "
+                    "before pressing Send again, so it isn’t posted twice."
+                )
+            await self.show(interaction, self.frame(notice))
+            return
+
+        self.closed = True
+        self.stop()
+        warnings: List[str] = []
+        if gone:
+            warnings.append(f"⚠️ {gone} of the roles you picked no longer exist, so they weren’t pinged.")
+        text = "\n".join([
+            f"✅ Posted in {channel.mention}. [Jump to the announcement]({message.jump_url})",
+            f"**Pinged:** {_announce_ping_summary(guild, draft)}",
+        ] + warnings)
+        await self.show(interaction, {"content": text, "embeds": [], "view": None, "allowed_mentions": discord.AllowedMentions.none()})
+
+    async def show(self, interaction: discord.Interaction, frame: Dict[str, Any]) -> None:
+        """Change the draft message after Send has already answered the press. If that fails, send the same words as a
+        new private message instead, so the moderator still learns what happened."""
+        try:
+            await interaction.edit_original_response(**frame)
+        except Exception:
+            log.warning("/announce: could not update the draft message", exc_info=True)
+            try:
+                await interaction.followup.send(
+                    frame.get("content") or "Done.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except Exception:
+                log.warning("/announce: could not tell the moderator what happened", exc_info=True)
+
+    @discord.ui.button(label="Cancel", emoji="✖️", style=discord.ButtonStyle.danger, row=3)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.closed = True
+        self.stop()
+        await interaction.response.edit_message(
+            content="Cancelled. Nothing was posted.", embeds=[], view=None, allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    # ----- when nobody finishes it, or something breaks ------------------------------------------------------------
+
+    async def on_timeout(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.latest is None:
+            return
+        try:
+            await self.latest.edit_original_response(
+                content="This draft timed out, so nothing was posted. Run /announce again to start a new one.",
+                embeds=[], view=None, allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception:
+            log.warning("/announce: could not update the draft after it timed out", exc_info=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        log.error("Unhandled error in the /announce buttons", exc_info=error)
+        self.busy = False
+        text = "Something went wrong with that button. Please look in the channel before trying again, in case it was posted."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except Exception:
+            log.warning("/announce: could not tell the moderator that a button failed", exc_info=True)
+
+
+@bot.tree.command(name="announce", description="Post an announcement in a channel you choose, with optional pings.")
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.checks.has_permissions(manage_messages=True)
+@app_commands.guild_only()
+async def announce_command(interaction: discord.Interaction):
+    guild = interaction.guild
+    assert guild is not None  # guaranteed by guild_only()
+    view = _AnnounceView(guild, interaction.user)
+    view.latest = interaction
+    await interaction.response.send_message(ephemeral=True, **view.frame())
 
 
 # --------------------------------------------------------------------------
