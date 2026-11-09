@@ -6742,6 +6742,21 @@ def _esom_message(region: str, direction: str, role: Optional[Any] = None, simul
     return text, embed, allowed
 
 
+def _esom_age_text(seconds: float) -> str:
+    """How long ago something was, in words, as fixed text: "1 second", "37 seconds", "2 minutes", "1 hour", "3 days". It counts whole units (rounded down)
+    and never says less than "1 second": a reading the bot has only just taken is under a second old when it posts the answer, and "0 seconds" would look wrong."""
+    whole = max(1, int(seconds))
+    if whole < 60:
+        number, unit = whole, "second"
+    elif whole < 3600:
+        number, unit = whole // 60, "minute"
+    elif whole < 86400:
+        number, unit = whole // 3600, "hour"
+    else:
+        number, unit = whole // 86400, "day"
+    return f"{number} {unit}" if number == 1 else f"{number} {unit}s"
+
+
 def _esom_status_embed(region: str, reading: Optional[_EsomReading], fresh: bool, now: datetime) -> Any:
     """The /server answer. A reading older than _ESOM_STALE_AFTER is never shown as the status, only as when it was last checked."""
     label = f"XBOX {region}"
@@ -6759,13 +6774,18 @@ def _esom_status_embed(region: str, reading: Optional[_EsomReading], fresh: bool
         else:
             shown = discord.utils.escape_markdown(discord.utils.escape_mentions(word or "nothing"))
             lines.append(f"❓ I can’t tell whether the {label} server is up or down: ESO Server Status shows “{shown}”.")
-        lines.append(f"Last checked {_fmt_relative(reading.at)} ({reading.at:%H:%M:%S} UTC).")
+        # "Last checked `1 second` ago (23:14:07)": the age is fixed text worked out now (it stays as it was when this was posted), and the time is a Discord stamp (style T) that
+        # each reader sees in their own time zone (a bot cannot know anyone's). Neither changes later, unlike the <t:N:R> kind, which says "3 hours ago" when read later.
+        age = _esom_age_text((now - reading.at).total_seconds())
+        lines.append(f"Last checked `{age}` ago (<t:{int(reading.at.timestamp())}:T>).")
         if not fresh:
             lines.append("I couldn’t check again just now, so this is from my last successful check.")
     else:
         lines.append(f"❓ I couldn’t check the {label} server just now, so I can’t say whether it is up or down.")
         if reading is not None:
-            lines.append(f"My last successful check was {_fmt_relative(reading.at)} ({reading.at:%H:%M:%S} UTC), which is too long ago to rely on.")
+            # (The same, with the date as well, style f: this reading can be hours or days old.)
+            age = _esom_age_text((now - reading.at).total_seconds())
+            lines.append(f"My last successful check was `{age}` ago (<t:{int(reading.at.timestamp())}:f>), which is too long ago to rely on.")
     embed = discord.Embed(title="Server status", url=_ESOM_LINK, description="\n".join(lines), colour=discord.Colour(colour))
     embed.set_footer(text=_esom_footer(region))
     return embed
