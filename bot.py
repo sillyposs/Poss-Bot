@@ -6178,7 +6178,7 @@ async def sos(interaction: discord.Interaction, reason: app_commands.Range[str, 
 #   "unknown". Unknown means nothing is announced, nobody is pinged, and the last confirmed status is kept.
 #
 # When it announces
-#   A change is believed only after two clear readings in a row agree on it, and is then announced once, per megaserver. The
+#   A change is believed as soon as one clear reading shows it (_ESOM_CONFIRM; it was two in a row until 12 Nov), and is then announced once, per megaserver. The
 #   first readings after start-up only set a baseline: nothing is announced. A status saved by the previous run is used again
 #   only if it is fresh (less than about 20 minutes old). The new status is saved BEFORE the message is posted, so a restart
 #   can never repeat an announcement. The price: an announcement that Discord refuses is logged, not retried.
@@ -6197,7 +6197,7 @@ async def sos(interaction: discord.Interaction, reason: app_commands.Range[str, 
 #   nobody is pinged unless ESO_STATUS_TEST_PINGS is "on".
 #
 # The category (ESO_STATUS_CATEGORY_ID, only while the bot is live in the main server)
-#   Its name is always "Xbox EU 🟢┊🟢 Xbox NA": one circle for each megaserver, 🟢 for up and 🔴 for down. Ninety seconds after a status change is
+#   Its name is always "Xbox EU 🟢┊🟢 Xbox NA": one circle for each megaserver, 🟢 for up and 🔴 for down. _ESOM_CATEGORY_DELAY seconds (15 now) after a status change is
 #   confirmed (so after the announcement, not with it, and so that EU and NA changing together is one rename, not two) the name is set to
 #   exactly that layout. A name that is already exactly right is left alone. If somebody renames the category by hand, the bot notices within
 #   seconds (it compares the name it last gave the category with its own copy, which costs nothing) and puts the standard name straight
@@ -6222,7 +6222,7 @@ _ESOM_TIMEOUT = 10  # seconds the site gets for each step of a request
 _ESOM_TOTAL_TIMEOUT = 25  # seconds for a whole check, reading the page included
 _ESOM_MAX_BYTES = 400_000  # the real page is about 25,000 bytes; a bigger one is not accepted
 _ESOM_MAX_TOKENS = 20_000  # pieces of markup and text looked at; the real page has fewer than a thousand
-_ESOM_CONFIRM = 2  # clear readings in a row that must agree before a change is believed
+_ESOM_CONFIRM = 1  # clear readings in a row that must agree before a change is believed
 _ESOM_RESTART_GRACE = 20 * 60  # seconds; a status saved longer ago than this is not trusted after a restart
 _ESOM_TOUCH_EVERY = 300  # seconds between "still alive" refreshes of the saved file when nothing has changed
 _ESOM_CACHE_SECONDS = 60  # /server reuses a reading this young instead of asking the site again
@@ -6232,7 +6232,7 @@ _ESOM_BACKOFF_CAP = 600  # seconds; the longest wait between checks while the si
 _ESOM_SEND_TIMEOUT = 30  # seconds Discord gets to accept a message
 _ESOM_SLEEP_SLICE = 5  # seconds; the monitor sleeps in slices this long so it notices at once that the bot is closing
 _ESOM_RED, _ESOM_GREEN, _ESOM_GREY = 0xFF0000, 0x00FF00, 0x95A5A6  # Dwemer's "down" embed is exactly this red
-_ESOM_CATEGORY_DELAY = 90  # seconds a combination of statuses must have stood before the category is renamed (the announcement goes out at once)
+_ESOM_CATEGORY_DELAY = 15  # seconds a combination of statuses must have stood before the category is renamed (the announcement goes out at once)
 _ESOM_CATEGORY_TICK = 5  # seconds between looks at the two statuses and at the category's name
 _ESOM_CATEGORY_TIMEOUT = 30  # seconds Discord gets to accept a rename (it allows only two renames of one channel in ten minutes)
 _ESOM_CATEGORY_RETRY = 600  # seconds to wait before trying again after a rename could not be done
